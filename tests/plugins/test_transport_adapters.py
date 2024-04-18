@@ -10,7 +10,11 @@ from conda import plugins
 from conda.exceptions import PluginError
 from conda.gateways.connection import Response
 from conda.gateways.connection.adapters.http import HTTPAdapter
-from conda.gateways.connection.session import CondaSession, get_session
+from conda.gateways.connection.session import (
+    CondaSession,
+    get_session,
+    get_transport_adapters,
+)
 
 PLUGIN_NAME = "http-custom"
 
@@ -19,9 +23,11 @@ PLUGIN_NAME = "http-custom"
 def clear_cache():
     CondaSession.cache_clear()
     get_session.cache_clear()
+    get_transport_adapters.cache_clear()
     yield
     CondaSession.cache_clear()
     get_session.cache_clear()
+    get_transport_adapters.cache_clear()
 
 
 class CustomHTTPAdapter(HTTPAdapter):
@@ -59,6 +65,8 @@ def test_get_transport_adapters(plugin_manager):
     transport_adapters = plugin_manager.get_transport_adapters()
     assert len(transport_adapters) == 1
     assert transport_adapters[PLUGIN_NAME].adapter is CustomHTTPAdapter
+
+    assert list(get_transport_adapters()) == list(transport_adapters.values())
 
 
 def test_duplicated(plugin_manager):

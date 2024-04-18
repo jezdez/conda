@@ -39,15 +39,22 @@ log = getLogger(__name__)
 RETRIES = 3
 
 
-CONDA_SESSION_SCHEMES = frozenset(
-    (
-        "http",
-        "https",
-        "ftp",
-        "s3",
-        "file",
-    )
-)
+def __getattr__(name):
+    if name == "CONDA_SESSION_SCHEMES":
+        return {
+            transport_adapter.adapter.scheme
+            for transport_adapter in get_transport_adapters()
+        }
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+@lru_cache(maxsize=None)
+def get_transport_adapters():
+    """
+    Load all the transport adapters from the plugin manager.
+    """
+    return context.plugin_manager.get_transport_adapters().values()
+
 
 
 def get_channel_name_from_url(url: str) -> str | None:
@@ -179,8 +186,7 @@ class CondaSession(Session, metaclass=CondaSessionType):
         via the transport_adapters plugin hook.
         """
         offline_adapter = OfflineAdapter()
-        transport_adapters = context.plugin_manager.get_transport_adapters()
-        for transport_adapter in transport_adapters.values():
+        for transport_adapter in get_transport_adapters():
             if context.offline and transport_adapter.scheme != "file":
                 adapter = offline_adapter
             else:
