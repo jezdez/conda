@@ -18,6 +18,7 @@ from ...common.url import (
     split_anaconda_token,
     urlparse,
 )
+from ...deprecations import deprecated
 from ...exceptions import ProxyError
 from ...models.channel import Channel
 from ..anaconda_client import read_binstar_tokens
@@ -29,11 +30,11 @@ from . import (
     get_auth_from_url,
     get_netrc_auth,
 )
-from .adapters.ftp import FTPAdapter  # noqa
-from .adapters.http import HTTPAdapter  # noqa
-from .adapters.localfs import LocalFSAdapter  # noqa
+from .adapters.ftp import FTPAdapter as _FTPAdapter
+from .adapters.http import HTTPAdapter as _HTTPAdapter
+from .adapters.localfs import LocalFSAdapter as _LocalFSAdapter
 from .adapters.offline import OfflineAdapter
-from .adapters.s3 import S3Adapter  # noqa
+from .adapters.s3 import S3Adapter as _S3Adapter
 
 log = getLogger(__name__)
 RETRIES = 3
@@ -55,6 +56,30 @@ def get_transport_adapters():
     """
     return context.plugin_manager.get_transport_adapters().values()
 
+
+@deprecated("24.5", "24.9", addendum="Use `conda.gateways.connection.adapters.offline.OfflineAdapter` instead.")
+class EnforceUnusedAdapter(OfflineAdapter):
+    "Deprecated adapter, should not be used."
+
+
+@deprecated("24.5", "24.9", addendum="Use `conda.gateways.connection.adapters.ftp.FTPAdapter` instead.")
+class FTPAdapter(_FTPAdapter):
+    "Deprecated adapter, should not be used."
+
+
+@deprecated("24.5", "24.9", addendum="Use `conda.gateways.connection.adapters.http.HTTPAdapter` instead.")
+class HTTPAdapter(_HTTPAdapter):
+    "Deprecated adapter, should not be used."
+
+
+@deprecated("24.5", "24.9", addendum="Use `conda.gateways.connection.adapters.localfs.LocalFSAdapter` instead.")
+class LocalFSAdapter(_LocalFSAdapter):
+    "Deprecated adapter, should not be used."
+
+
+@deprecated("24.5", "24.9", addendum="Use `conda.gateways.connection.adapters.s3.S3Adapter` instead.")
+class S3Adapter(_S3Adapter):
+    "Deprecated adapter, should not be used."
 
 
 def get_channel_name_from_url(url: str) -> str | None:
