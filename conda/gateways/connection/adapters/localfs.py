@@ -1,6 +1,7 @@
 # Copyright (C) 2012 Anaconda, Inc
 # SPDX-License-Identifier: BSD-3-Clause
 """Defines local filesystem transport adapter for CondaSession (requests.Session)."""
+from __future__ import annotations
 
 import json
 from email.utils import formatdate
@@ -8,6 +9,7 @@ from logging import getLogger
 from mimetypes import guess_type
 from os import stat
 from tempfile import SpooledTemporaryFile
+from typing import TYPE_CHECKING
 
 from ....common.compat import ensure_binary
 from ....common.path import url_to_path
@@ -15,11 +17,20 @@ from .. import BaseAdapter, CaseInsensitiveDict, Response
 
 log = getLogger(__name__)
 
+if TYPE_CHECKING:
+    from .. import PreparedRequest
+
 
 class LocalFSAdapter(BaseAdapter):
     def send(
-        self, request, stream=None, timeout=None, verify=None, cert=None, proxies=None
-    ):
+        self,
+        request: PreparedRequest,
+        stream: bool = False,
+        timeout: None | float | tuple[float, float] | tuple[float, None] = None,
+        verify: bool | str = True,
+        cert: None | bytes | str | tuple[bytes | str, bytes | str] = None,
+        proxies: dict[str, str] | None = None,
+    ) -> Response:
         pathname = url_to_path(request.url)
 
         resp = Response()
@@ -55,5 +66,5 @@ class LocalFSAdapter(BaseAdapter):
             resp.close = resp.raw.close
         return resp
 
-    def close(self):
+    def close(self) -> None:
         pass  # pragma: no cover

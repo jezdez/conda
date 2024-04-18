@@ -32,14 +32,16 @@ LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
+from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING
 
 from .. import DEFAULT_POOLBLOCK
-from .. import HTTPAdapter as BaseHTTPAdapter
+from .. import HTTPAdapter as _BaseHTTPAdapter
 
 if TYPE_CHECKING:
     from ssl import SSLContext
+    from typing import Any
 
     from urllib3 import PoolManager
 
@@ -55,7 +57,7 @@ class _SSLContextAdapterMixin:
     def __init__(
         self,
         *,
-        ssl_context: Optional["SSLContext"] = None,
+        ssl_context: SSLContext | None = None,
         **kwargs: Any,
     ) -> None:
         self._ssl_context = ssl_context
@@ -67,7 +69,7 @@ class _SSLContextAdapterMixin:
         maxsize: int,
         block: bool = DEFAULT_POOLBLOCK,
         **pool_kwargs: Any,
-    ) -> "PoolManager":
+    ) -> PoolManager:
         if self._ssl_context is not None:
             pool_kwargs.setdefault("ssl_context", self._ssl_context)
         return super().init_poolmanager(  # type: ignore[misc]
@@ -78,5 +80,5 @@ class _SSLContextAdapterMixin:
         )
 
 
-class HTTPAdapter(_SSLContextAdapterMixin, BaseHTTPAdapter):
+class HTTPAdapter(_SSLContextAdapterMixin, _BaseHTTPAdapter):
     pass
