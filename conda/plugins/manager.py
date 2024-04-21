@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from typing import Literal
 
     from requests.auth import AuthBase
+    from requests.adapters import BaseAdapter
 
     from ..common.configuration import ParameterLoader
     from ..core.solve import Solver
@@ -298,6 +299,19 @@ class CondaPluginManager(pluggy.PluginManager):
 
         if len(matches) > 0:
             return matches[0].handler
+        return None
+
+    def get_transport_adapter(self, name: str) -> type[BaseAdapter] | None:
+        """
+        Get the transport adapter with the given name or None
+        """
+        transport_adapters = self.get_hook_results("transport_adapters")
+        matches = tuple(
+            item for item in transport_adapters if item.name.lower() == name.lower().strip()
+        )
+
+        if len(matches) > 0:
+            return matches[0]
         return None
 
     def get_settings(self) -> dict[str, ParameterLoader]:

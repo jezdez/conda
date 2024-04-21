@@ -9,8 +9,7 @@ from ...gateways.connection.adapters.http import HTTPAdapter
 from .. import CondaTransportAdapter, hookimpl
 
 
-@hookimpl
-def conda_transport_adapters():
+def get_http_adapter(channel_name):
     ssl_context = None
     if context.ssl_verify == "truststore":
         try:
@@ -35,6 +34,10 @@ def conda_transport_adapters():
         raise_on_status=False,
         respect_retry_after_header=False,
     )
-    http_adapter = HTTPAdapter(max_retries=retry, ssl_context=ssl_context)
-    yield CondaTransportAdapter(name="https", scheme="https", adapter=http_adapter)
-    yield CondaTransportAdapter(name="http", scheme="http", adapter=http_adapter)
+    return HTTPAdapter(channel_name=channel_name, max_retries=retry, ssl_context=ssl_context)
+
+
+@hookimpl
+def conda_transport_adapters():
+    yield CondaTransportAdapter(name="https", scheme="https", adapter=get_http_adapter)
+    yield CondaTransportAdapter(name="http", scheme="http", adapter=get_http_adapter)

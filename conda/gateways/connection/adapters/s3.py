@@ -11,7 +11,8 @@ from typing import TYPE_CHECKING
 
 from ....common.compat import ensure_binary
 from ....common.url import url_to_s3_info
-from .. import BaseAdapter, CaseInsensitiveDict, Response
+from ....plugins.types import ChannelBaseAdapter
+from .. import CaseInsensitiveDict, Response
 
 if TYPE_CHECKING:
     from .. import PreparedRequest
@@ -20,7 +21,7 @@ log = getLogger(__name__)
 stderrlog = LoggerAdapter(getLogger("conda.stderrlog"), extra=dict(terminator="\n"))
 
 
-class S3Adapter(BaseAdapter):
+class S3Adapter(ChannelBaseAdapter):
     def send(
         self,
         request: PreparedRequest,

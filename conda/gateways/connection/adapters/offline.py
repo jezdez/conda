@@ -6,10 +6,10 @@ context.offline is True.
 """
 
 from ....auxlib.ish import dals
-from .. import BaseAdapter
+from ....plugins.types import ChannelBaseAdapter
 
 
-class OfflineAdapter(BaseAdapter):
+class OfflineAdapter(ChannelBaseAdapter):
     def send(self, request, *args, **kwargs):
         message = dals(
             f"""

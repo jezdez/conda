@@ -26,7 +26,8 @@ from logging import getLogger
 from ....common.url import urlparse
 from ....deprecations import deprecated
 from ....exceptions import AuthenticationError
-from .. import BaseAdapter, Response, dispatch_hook
+from ....plugins.types import ChannelBaseAdapter
+from .. import Response, dispatch_hook
 
 log = getLogger(__name__)
 
@@ -45,11 +46,11 @@ def _new_makepasv(self):
 ftplib.FTP.makepasv = _new_makepasv
 
 
-class FTPAdapter(BaseAdapter):
+class FTPAdapter(ChannelBaseAdapter):
     """A Requests Transport Adapter that handles FTP urls."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, channel_name):
+        super().__init__(channel_name)
 
         # Build a dictionary keyed off the methods we support in upper case.
         # The values of this dictionary should be the functions we use to

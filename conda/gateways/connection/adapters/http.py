@@ -36,6 +36,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ....plugins.types import ChannelNameMixin
 from .. import DEFAULT_POOLBLOCK
 from .. import HTTPAdapter as _BaseHTTPAdapter
 
@@ -80,5 +81,5 @@ class _SSLContextAdapterMixin:
         )
 
 
-class HTTPAdapter(_SSLContextAdapterMixin, _BaseHTTPAdapter):
+class HTTPAdapter(ChannelNameMixin, _SSLContextAdapterMixin, _BaseHTTPAdapter):
     pass

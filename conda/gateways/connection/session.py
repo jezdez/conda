@@ -8,6 +8,7 @@ from fnmatch import fnmatch
 from functools import lru_cache
 from logging import getLogger
 from threading import local
+from typing import TYPE_CHECKING
 
 from ...auxlib.ish import dals
 from ...base.constants import CONDA_HOMEPAGE_URL
@@ -36,6 +37,9 @@ from .adapters.localfs import LocalFSAdapter as _LocalFSAdapter
 from .adapters.offline import OfflineAdapter
 from .adapters.s3 import S3Adapter as _S3Adapter
 
+if TYPE_CHECKING:
+    from typing import Any
+
 log = getLogger(__name__)
 RETRIES = 3
 
@@ -57,27 +61,47 @@ def get_transport_adapters():
     return context.plugin_manager.get_transport_adapters().values()
 
 
-@deprecated("24.5", "24.9", addendum="Use `conda.gateways.connection.adapters.offline.OfflineAdapter` instead.")
+@deprecated(
+    "24.5",
+    "24.9",
+    addendum="Use `conda.gateways.connection.adapters.offline.OfflineAdapter` instead.",
+)
 class EnforceUnusedAdapter(OfflineAdapter):
     "Deprecated adapter, should not be used."
 
 
-@deprecated("24.5", "24.9", addendum="Use `conda.gateways.connection.adapters.ftp.FTPAdapter` instead.")
+@deprecated(
+    "24.5",
+    "24.9",
+    addendum="Use `conda.gateways.connection.adapters.ftp.FTPAdapter` instead.",
+)
 class FTPAdapter(_FTPAdapter):
     "Deprecated adapter, should not be used."
 
 
-@deprecated("24.5", "24.9", addendum="Use `conda.gateways.connection.adapters.http.HTTPAdapter` instead.")
+@deprecated(
+    "24.5",
+    "24.9",
+    addendum="Use `conda.gateways.connection.adapters.http.HTTPAdapter` instead.",
+)
 class HTTPAdapter(_HTTPAdapter):
     "Deprecated adapter, should not be used."
 
 
-@deprecated("24.5", "24.9", addendum="Use `conda.gateways.connection.adapters.localfs.LocalFSAdapter` instead.")
+@deprecated(
+    "24.5",
+    "24.9",
+    addendum="Use `conda.gateways.connection.adapters.localfs.LocalFSAdapter` instead.",
+)
 class LocalFSAdapter(_LocalFSAdapter):
     "Deprecated adapter, should not be used."
 
 
-@deprecated("24.5", "24.9", addendum="Use `conda.gateways.connection.adapters.s3.S3Adapter` instead.")
+@deprecated(
+    "24.5",
+    "24.9",
+    addendum="Use `conda.gateways.connection.adapters.s3.S3Adapter` instead.",
+)
 class S3Adapter(_S3Adapter):
     "Deprecated adapter, should not be used."
 
@@ -89,17 +113,19 @@ def get_channel_name_from_url(url: str) -> str | None:
     return Channel.from_url(url).canonical_name
 
 
-@lru_cache(maxsize=None)
+# @lru_cache(maxsize=None)
 def get_session(url: str):
     """
     Function that determines the correct Session object to be returned
     based on the URL that is passed in.
     """
     channel_name = get_channel_name_from_url(url)
+    log.info("getting session for channel %s", channel_name)
 
     # If for whatever reason a channel name can't be determined, (should be unlikely)
     # we just return the default session object.
     if channel_name is None:
+        log.info("No channel name found for url %s", url)
         return CondaSession()
 
     # We ensure here if there are duplicates defined, we choose the last one
@@ -129,29 +155,53 @@ def get_session(url: str):
 
     # Return default session object
     if auth_handler is None:
-        return CondaSession()
+        session = CondaSession(channel_name=channel_name)
 
-    auth_handler_cls = context.plugin_manager.get_auth_handler(auth_handler)
+    else:
+        auth_handler_cls = context.plugin_manager.get_auth_handler(auth_handler)
 
-    if not auth_handler_cls:
-        return CondaSession()
+        if auth_handler_cls:
+            session = CondaSession(channel_name=channel_name, auth=auth_handler_cls(channel_name))
+        else:
+            session = CondaSession(channel_name=channel_name)
 
-    return CondaSession(auth=auth_handler_cls(channel_name))
+    configured_transport = channel_settings.get("transport", "").strip() or None
+    from conda_oci_mirror.logger import logger
+    logger.warning(f"{channel_name}{configured_transport}")
+
+    if configured_transport is not None:
+        transport_adapter = context.plugin_manager.get_transport_adapter(configured_transport)
+        if transport_adapter:
+            print(f"mounting {channel_name} {transport_adapter}")
+            logger.warning(f"{transport_adapter.scheme}+{channel_name}")
+            session.mount(
+                f"{transport_adapter.scheme}+{channel_name}",  # e.g., oci+https://conda.anaconda.org/main
+                transport_adapter.adapter(channel_name=channel_name),
+            )
+
+    return session
 
 
-def get_session_storage_key(auth) -> str:
+def get_session_storage_key(channel_name: str | None, auth: Any = None) -> str:
     """
     Function that determines which storage key to use for our CondaSession object caching
     """
+    components = [
+        channel_name or "default",
+    ]
+
     if auth is None:
-        return "default"
+        components.append("default")
 
-    if isinstance(auth, tuple):
-        return hash(auth)
+    elif isinstance(auth, tuple):
+        components.append(hash(auth))
 
-    auth_type = type(auth)
-
-    return f"{auth_type.__module__}.{auth_type.__qualname__}::{auth.channel_name}"
+    else:
+        auth_type = type(auth)
+        components.append(
+            f"{auth_type.__module__}.{auth_type.__qualname__}::{auth.channel_name}"
+        )
+    return "::".join(components)
 
 
 class CondaSessionType(type):
@@ -165,7 +215,7 @@ class CondaSessionType(type):
         return super().__new__(mcs, name, bases, dct)
 
     def __call__(cls, **kwargs):
-        storage_key = get_session_storage_key(kwargs.get("auth"))
+        storage_key = get_session_storage_key(kwargs.get("channel_name"), kwargs.get("auth"))
 
         try:
             return cls._thread_local.sessions[storage_key]
@@ -181,11 +231,13 @@ class CondaSessionType(type):
 
 
 class CondaSession(Session, metaclass=CondaSessionType):
-    def __init__(self, auth: AuthBase | tuple[str, str] | None = None):
+    def __init__(self, channel_name: str | None = None, auth: AuthBase | tuple[str, str] | None = None):
         """
         :param auth: Optionally provide ``requests.AuthBase`` compliant objects
         """
         super().__init__()
+
+        self.channel_name = channel_name
 
         self.auth = auth or CondaHttpAuth()
 
@@ -210,14 +262,12 @@ class CondaSession(Session, metaclass=CondaSessionType):
         Registers the transport adapters to a prefix as registered
         via the transport_adapters plugin hook.
         """
-        offline_adapter = OfflineAdapter()
+        offline_adapter = OfflineAdapter(channel_name=self.channel_name)
         for transport_adapter in get_transport_adapters():
             if context.offline and transport_adapter.scheme != "file":
                 adapter = offline_adapter
             else:
-                adapter = transport_adapter.adapter
-                if callable(adapter):
-                    adapter = adapter()
+                adapter = transport_adapter.adapter(channel_name=self.channel_name)
             self.mount(f"{transport_adapter.scheme}://", adapter)
 
     @classmethod

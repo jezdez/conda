@@ -104,6 +104,7 @@ For examples of how to use other plugin hooks, please read their respective docu
    settings
    solvers
    subcommands
+   transport_adapters
    virtual_packages
 
 

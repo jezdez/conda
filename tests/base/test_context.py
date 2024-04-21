@@ -88,9 +88,7 @@ def testdata() -> None:
 
 def test_migrated_custom_channels(testdata: None):
     assert (
-        Channel(
-            "https://some.url.somewhere/stuff/darwin/noarch/a-mighty-fine.tar.bz2"
-        ).canonical_name
+        Channel("https://some.url.somewhere/stuff/darwin/noarch/a-mighty-fine.tar.bz2").canonical_name
         == "darwin"
     )
     assert (

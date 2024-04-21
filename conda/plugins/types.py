@@ -12,13 +12,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
+from requests.adapters import BaseAdapter
 from requests.auth import AuthBase
 
 if TYPE_CHECKING:
     from argparse import ArgumentParser, Namespace
     from typing import Callable
-
-    from requests.adapters import BaseAdapter
 
     from ..common.configuration import Parameter
     from ..core.solve import Solver
@@ -118,10 +117,12 @@ class CondaPostCommand(NamedTuple):
 class ChannelNameMixin:
     """
     Class mixin to make all plugin implementations compatible, e.g. when they
-    use an existing (e.g. 3rd party) requests authentication handler.
+    use an existing (e.g. 3rd party) requests authentication handler
+    or transport adapter.
 
     Please use the concrete :class:`~conda.plugins.types.ChannelAuthBase`
-    in case you're creating an own implementation.
+    or :class:`~conda.plugins.types.ChannelBaseAdapter` in case you're
+    creating an own implementation.
     """
 
     def __init__(self, channel_name: str, *args, **kwargs):
@@ -135,6 +136,16 @@ class ChannelAuthBase(ChannelNameMixin, AuthBase):
 
     Authentication is tightly coupled with individual channels. Therefore, an additional
     ``channel_name`` property must be set on the ``requests.auth.AuthBase`` based class.
+    """
+
+
+class ChannelBaseAdapter(ChannelNameMixin, BaseAdapter):
+    """
+    Base class that we require all plugin implementations to use to be compatible.
+
+    File transport is tightly coupled with individual channels. Therefore, an additional
+    ``channel_name`` property must be set on the ``requests.adapters.BaseAdapter``
+    based class.
     """
 
 
@@ -166,7 +177,7 @@ class CondaTransportAdapter(NamedTuple):
 
     name: str
     scheme: str
-    adapter: type[BaseAdapter]
+    adapter: type[ChannelBaseAdapter]
 
 
 class CondaHealthCheck(NamedTuple):

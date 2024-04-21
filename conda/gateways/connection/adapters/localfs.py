@@ -13,7 +13,8 @@ from typing import TYPE_CHECKING
 
 from ....common.compat import ensure_binary
 from ....common.path import url_to_path
-from .. import BaseAdapter, CaseInsensitiveDict, Response
+from ....plugins.types import ChannelBaseAdapter
+from .. import CaseInsensitiveDict, Response
 
 log = getLogger(__name__)
 
@@ -21,7 +22,7 @@ if TYPE_CHECKING:
     from .. import PreparedRequest
 
 
-class LocalFSAdapter(BaseAdapter):
+class LocalFSAdapter(ChannelBaseAdapter):
     def send(
         self,
         request: PreparedRequest,
