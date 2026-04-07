@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING, overload
 
 from frozendict import frozendict
 
-# detect the best json library to use
-from requests.compat import json
+# detect the best json library to use; replaced by stdlib json in #15866
+from requests.compat import json  # noqa: TID253
 
 if TYPE_CHECKING:
     from io import IO
