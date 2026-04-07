@@ -28,15 +28,15 @@ def configure_parser(sub_parsers: _SubParsersAction, **kwargs) -> ArgumentParser
 
 
 def execute(args: Namespace, parser: ArgumentParser) -> int:
-    from .conda_argparse import find_builtin_commands
+    from ..base.context import context
+    from .conda_argparse import BUILTIN_COMMANDS
 
-    # Ensure plugin subcommands are discovered before listing
-    sub_parsers_action = parser._subparsers._group_actions[0]
-    if hasattr(sub_parsers_action, "_ensure_plugins_loaded"):
-        sub_parsers_action._ensure_plugins_loaded()
-
+    # Use BUILTIN_COMMANDS + registered plugin subcommands directly rather than
+    # reading from parser.choices: _check_value creates a disconnected snapshot
+    # of choices before _ensure_plugins_loaded() runs in __call__, so plugin
+    # commands would be missing from find_builtin_commands(parser).
     print(
-        *sorted(find_builtin_commands(parser)),
+        *sorted({*BUILTIN_COMMANDS, *context.plugin_manager.get_subcommands()}),
         sep="\n",
         end="",
     )
