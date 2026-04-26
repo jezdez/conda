@@ -598,7 +598,18 @@ class PrefixReplaceLinkAction(LinkPathAction):
                 len(self.prefix_placeholder),
             )
 
-        sha256_in_prefix = compute_sum(self.intermediate_path, "sha256")
+        # B4 (tempo Phase-2 S4): hashing the rewritten file is ~25% of
+        # per-file verify wall time at 50 MB sizes (Phase-2 S4 data:
+        # 100 ms/file at 50 MB, of which ~25 ms is SHA-256). The
+        # recorded ``sha256_in_prefix`` is consumed by
+        # conda.plugins.subcommands.doctor.health_checks.altered_files
+        # — which already falls back gracefully when the field is
+        # ``None``. Only compute the hash when the user has opted in
+        # to the extra safety checks gated on this field.
+        if context.extra_safety_checks:
+            sha256_in_prefix = compute_sum(self.intermediate_path, "sha256")
+        else:
+            sha256_in_prefix = None
 
         self.prefix_path_data = PathDataV1.from_objects(
             self.prefix_path_data,
