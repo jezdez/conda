@@ -70,8 +70,13 @@ try:
     from conda_package_handling.api import THREADSAFE_EXTRACT
 except ImportError:
     THREADSAFE_EXTRACT = False
-# On the machines we tested, extraction doesn't get any faster after 3 threads
-EXTRACT_THREADS = min(os.cpu_count() or 1, 3) if THREADSAFE_EXTRACT else 1
+# Phase-2 S8 microbenchmark (jezdez/conda-tempo@track-b-transaction.md):
+# extraction does not parallelize well past 2 threads on either macOS
+# APFS or Linux ext4 on modern NVMe. The 2020-era min(cpu, 3) cap
+# regressed Linux by 28-40 % at K >= 3 and was ~flat on macOS.
+# EXTRACT_THREADS = 2 is near-optimal on both filesystems at the 5 to
+# 10 package batch sizes typical of conda installs.
+EXTRACT_THREADS = 2 if THREADSAFE_EXTRACT else 1
 
 
 class PackageCacheType(type):
