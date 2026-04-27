@@ -70,6 +70,12 @@ _VERSION_BUILD_RE: re.Pattern[str] = re.compile(
 )
 
 
+# Sentinel for the lazy rattler-fast-path cache on MatchSpec instances.
+# ``None`` means "attempted and fell through", so a distinct sentinel is
+# needed to represent "not yet attempted". Never exposed publicly.
+_RATTLER_UNSET = object()
+
+
 class MatchSpecType(type):
     def __call__(cls, spec_arg=None, **kwargs):
         try:
@@ -222,6 +228,12 @@ class MatchSpec(metaclass=MatchSpecType):
         self._target = target
         self._original_spec_str = kwargs.pop("_original_spec_str", None)
         self._match_components = self._build_components(**kwargs)
+        # Optional py-rattler fast path. Built lazily on first .match()
+        # call so specs that never get matched (e.g. built for display
+        # or dict inspection) don't pay the rattler parse cost.
+        # Sentinel ``_UNSET`` distinguishes "not yet attempted" from
+        # "attempted and fell through" (cached as ``None``).
+        self._rattler_spec = _RATTLER_UNSET
 
     @classmethod
     def from_dist_str(cls, dist_str):
@@ -298,6 +310,19 @@ class MatchSpec(metaclass=MatchSpecType):
             from .records import PackageRecord
 
             rec = PackageRecord.from_objects(rec)
+        # Optional py-rattler fast path. Returns None (fall through) if
+        # rattler is absent, can't parse the spec, or can't convert the
+        # record. The conda-native loop below remains authoritative.
+        if self._rattler_spec is _RATTLER_UNSET:
+            from ._match_spec_rattler import try_build
+
+            self._rattler_spec = try_build(self._original_spec_str or str(self))
+        if self._rattler_spec is not None:
+            from ._match_spec_rattler import try_match
+
+            result = try_match(self._rattler_spec, rec)
+            if result is not None:
+                return result
         for field_name, v in self._match_components.items():
             if not self._match_individual(rec, field_name, v):
                 return False
