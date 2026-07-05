@@ -7,6 +7,7 @@ import os
 import sys
 from logging import getLogger
 from os.path import basename, dirname, getsize, isdir, isfile, join, lexists
+from shutil import copytree
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -14,7 +15,8 @@ import pytest
 
 from conda.auxlib.collection import AttrDict
 from conda.auxlib.ish import dals
-from conda.base.context import context
+from conda.base.constants import PREFIX_PLACEHOLDER
+from conda.base.context import context, reset_context
 from conda.common.compat import on_win
 from conda.common.iterators import groupby_to_dict as groupby
 from conda.common.path import (
@@ -27,9 +29,12 @@ from conda.common.path import (
     win_path_ok,
 )
 from conda.core.path_actions import (
+    BulkClonePathAction,
+    BulkHardLinkPathAction,
     CompileMultiPycAction,
     CreatePythonEntryPointAction,
     LinkPathAction,
+    PrefixReplaceLinkAction,
 )
 from conda.gateways.disk.create import create_link, mkdir_p
 from conda.gateways.disk.delete import rm_rf
@@ -38,7 +43,7 @@ from conda.gateways.disk.permissions import is_executable
 from conda.gateways.disk.read import compute_sum
 from conda.gateways.disk.test import softlink_supported
 from conda.models.channel import Channel
-from conda.models.enums import LinkType, NoarchType, PathEnum
+from conda.models.enums import FileMode, LinkType, NoarchType, PathEnum
 from conda.models.package_info import Noarch, PackageInfo, PackageMetadata
 from conda.models.records import PackageRecord, PathDataV1, PathsData
 
@@ -481,6 +486,240 @@ def test_simple_LinkPathAction_copy(prefix: Path, pkgs_dir: Path):
 
     axn.reverse()
     assert not lexists(axn.target_full_path)
+
+
+def test_BulkHardLinkPathAction_hardlink(prefix: Path, pkgs_dir: Path):
+    source_full_paths = (make_test_file(pkgs_dir), make_test_file(pkgs_dir))
+    actions = []
+    for source_full_path in source_full_paths:
+        source_short_path = basename(source_full_path)
+        source_path_data = PathDataV1(
+            _path=source_short_path,
+            path_type=PathEnum.hardlink,
+            sha256=compute_sum(source_full_path, "sha256"),
+            size_in_bytes=getsize(source_full_path),
+        )
+        actions.append(
+            LinkPathAction(
+                {},
+                None,
+                pkgs_dir,
+                source_short_path,
+                prefix,
+                source_short_path,
+                LinkType.hardlink,
+                source_path_data,
+            )
+        )
+
+    bulk = BulkHardLinkPathAction(*actions)
+
+    assert bulk.target_full_paths == tuple(
+        action.target_full_path for action in actions
+    )
+    bulk.verify()
+    assert all(action.verified for action in actions)
+    assert all(action.prefix_path_data is not None for action in actions)
+
+    bulk.execute()
+    assert all(isfile(action.target_full_path) for action in actions)
+    assert all(os.lstat(action.target_full_path).st_nlink == 2 for action in actions)
+
+    bulk.reverse()
+    assert all(not lexists(action.target_full_path) for action in actions)
+
+
+def test_BulkClonePathAction_clones_manifest_directory(
+    monkeypatch: pytest.MonkeyPatch, prefix: Path, pkgs_dir: Path
+):
+    package_dir = pkgs_dir / "package"
+    source_dir = package_dir / "lib" / "demo"
+    source_dir.mkdir(parents=True)
+    source_paths = (source_dir / "one.py", source_dir / "two.py")
+    for source_path in source_paths:
+        source_path.write_text("contents")
+
+    directory_action = LinkPathAction(
+        {},
+        AttrDict(extracted_package_dir=str(package_dir)),
+        None,
+        None,
+        prefix,
+        "lib/demo",
+        LinkType.directory,
+        None,
+    )
+    file_actions = []
+    for source_path in source_paths:
+        source_short_path = f"lib/demo/{source_path.name}"
+        source_path_data = PathDataV1(
+            _path=source_short_path,
+            path_type=PathEnum.hardlink,
+            sha256=compute_sum(source_path, "sha256"),
+            size_in_bytes=getsize(source_path),
+        )
+        file_actions.append(
+            LinkPathAction(
+                {},
+                AttrDict(extracted_package_dir=str(package_dir)),
+                str(package_dir),
+                source_short_path,
+                prefix,
+                source_short_path,
+                LinkType.clone,
+                source_path_data,
+            )
+        )
+    clone_calls = []
+
+    def fake_clone_directory(src, dst):
+        clone_calls.append((src, dst))
+        copytree(src, dst)
+        return True
+
+    monkeypatch.setattr("conda.core.path_actions.clone_directory", fake_clone_directory)
+
+    bulk = BulkClonePathAction((directory_action,), tuple(file_actions))
+
+    bulk.verify()
+    assert all(action.verified for action in file_actions)
+    assert all(action.prefix_path_data is not None for action in file_actions)
+
+    bulk.execute()
+
+    assert clone_calls == [(str(package_dir / "lib"), str(prefix / "lib"))]
+    assert all(isfile(action.target_full_path) for action in file_actions)
+    assert all(action._execute_successful for action in file_actions)
+
+    bulk.reverse()
+    assert all(not lexists(action.target_full_path) for action in file_actions)
+
+
+def test_BulkClonePathAction_touches_cloned_site_packages(
+    monkeypatch: pytest.MonkeyPatch, prefix: Path, pkgs_dir: Path
+):
+    package_dir = pkgs_dir / "package"
+    site_packages = "lib/python3.12/site-packages"
+    source_dir = package_dir / site_packages / "demo"
+    source_dir.mkdir(parents=True)
+    source_path = source_dir / "__init__.py"
+    source_path.write_text("contents")
+    source_short_path = f"{site_packages}/demo/__init__.py"
+    source_path_data = PathDataV1(
+        _path=source_short_path,
+        path_type=PathEnum.hardlink,
+        sha256=compute_sum(source_path, "sha256"),
+        size_in_bytes=getsize(source_path),
+    )
+    transaction_context = {"target_site_packages_short_path": site_packages}
+    directory_action = LinkPathAction(
+        transaction_context,
+        AttrDict(extracted_package_dir=str(package_dir)),
+        None,
+        None,
+        prefix,
+        f"{site_packages}/demo",
+        LinkType.directory,
+        None,
+    )
+    file_action = LinkPathAction(
+        transaction_context,
+        AttrDict(extracted_package_dir=str(package_dir)),
+        str(package_dir),
+        source_short_path,
+        prefix,
+        source_short_path,
+        LinkType.clone,
+        source_path_data,
+    )
+    touched = []
+
+    def fake_clone_directory(src, dst):
+        copytree(src, dst)
+        return True
+
+    monkeypatch.setattr("conda.core.path_actions.clone_directory", fake_clone_directory)
+    monkeypatch.setattr(
+        "conda.core.path_actions.touch", lambda path: touched.append(path)
+    )
+
+    bulk = BulkClonePathAction((directory_action,), (file_action,))
+    bulk.verify()
+    bulk.execute()
+
+    assert touched == [str(prefix / site_packages)]
+
+
+def test_PrefixReplaceLinkAction_lazy_verify_signs_immediately(
+    monkeypatch: pytest.MonkeyPatch, prefix: Path, tmp_path: Path
+):
+    previous_extra_safety = os.environ.get("CONDA_EXTRA_SAFETY_CHECKS")
+    monkeypatch.setenv("CONDA_EXTRA_SAFETY_CHECKS", "true")
+    reset_context()
+
+    package_dir = tmp_path / "package"
+    source_short_path = "bin/tool"
+    source_full_path = package_dir / source_short_path
+    source_full_path.parent.mkdir(parents=True)
+    source_full_path.write_bytes(b"contents")
+    source_path_data = PathDataV1(
+        _path=source_short_path,
+        path_type=PathEnum.hardlink,
+        sha256=compute_sum(source_full_path, "sha256"),
+        size_in_bytes=getsize(source_full_path),
+    )
+    transaction_context = {"temp_dir": str(tmp_path / "transaction-temp")}
+    action = PrefixReplaceLinkAction(
+        transaction_context,
+        AttrDict(
+            repodata_record=AttrDict(name="demo", subdir="osx-arm64"),
+            extracted_package_dir=str(package_dir),
+        ),
+        str(package_dir),
+        source_short_path,
+        prefix,
+        source_short_path,
+        LinkType.hardlink,
+        PREFIX_PLACEHOLDER,
+        FileMode.binary,
+        source_path_data,
+    )
+    codesign_calls = []
+    updated_sha256 = "updated-sha256"
+
+    def fake_update_prefix(*args, **kwargs):
+        assert kwargs["sign_binary"] is False
+        assert kwargs["return_sha256"] is True
+        return True, updated_sha256
+
+    monkeypatch.setattr("conda.core.path_actions.update_prefix", fake_update_prefix)
+
+    def fake_compute_sum(path, algorithm):
+        if action.intermediate_path and path == action.intermediate_path:
+            pytest.fail("updated sha256 should be reused")
+        return source_path_data.sha256
+
+    monkeypatch.setattr("conda.core.path_actions.compute_sum", fake_compute_sum)
+    monkeypatch.setattr(
+        "conda.core.path_actions.needs_osx_arm64_codesign", lambda *args: True
+    )
+    monkeypatch.setattr(
+        "conda.core.path_actions.codesign_paths",
+        lambda paths: codesign_calls.append(tuple(paths)),
+    )
+
+    try:
+        action.verify(queue_codesign=False)
+    finally:
+        if previous_extra_safety is None:
+            monkeypatch.delenv("CONDA_EXTRA_SAFETY_CHECKS", raising=False)
+        else:
+            monkeypatch.setenv("CONDA_EXTRA_SAFETY_CHECKS", previous_extra_safety)
+        reset_context()
+
+    assert codesign_calls == [(action.intermediate_path,)]
+    assert "osx_arm64_codesign_paths" not in transaction_context
+    assert action.prefix_path_data.sha256_in_prefix == updated_sha256
 
 
 def test_create_file_link_actions(tmp_path):

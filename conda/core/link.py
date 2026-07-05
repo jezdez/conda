@@ -51,6 +51,7 @@ from ..exceptions import (
     maybe_raise,
 )
 from ..gateways.disk import mkdir_p
+from ..gateways.disk.create import clone_file_supported
 from ..gateways.disk.delete import rm_rf
 from ..gateways.disk.read import isfile, lexists, read_package_info
 from ..gateways.disk.test import (
@@ -66,6 +67,8 @@ from ..utils import get_comspec, human_bytes, wrap_subprocess_call
 from .package_cache_data import PackageCacheData
 from .path_actions import (
     AggregateCompileMultiPycAction,
+    BulkClonePathAction,
+    BulkHardLinkPathAction,
     CompileMultiPycAction,
     CreatePrefixRecordAction,
     CreatePythonEntryPointAction,
@@ -78,6 +81,7 @@ from .path_actions import (
     UnregisterEnvironmentLocationAction,
     UpdateHistoryAction,
 )
+from .portability import codesign_paths
 from .prefix_data import PrefixData
 
 if TYPE_CHECKING:
@@ -96,6 +100,10 @@ def determine_link_type(extracted_package_dir, target_prefix):
         return LinkType.copy
     if context.always_softlink:
         return LinkType.softlink
+    # Clone comes before hardlink so APFS can clone whole eligible directories;
+    # CreatePrefixRecordAction normalizes this internal mode back to copy.
+    if clone_file_supported(source_test_file, target_prefix):
+        return LinkType.clone
     if hardlink_supported(source_test_file, target_prefix):
         return LinkType.hardlink
     if context.allow_softlinks and softlink_supported(source_test_file, target_prefix):
@@ -328,6 +336,7 @@ class UnlinkLinkTransaction:
                     rm_rf(self.transaction_context["temp_dir"])
                     raise
                 log.info(exceptions)
+            codesign_paths(self.transaction_context.pop("osx_arm64_codesign_paths", ()))
         try:
             self._verify_pre_link_message(
                 itertools.chain(
@@ -348,10 +357,14 @@ class UnlinkLinkTransaction:
             prelink_msg_dir = (
                 Path(act.pkg_data.extracted_package_dir) / "info" / "prelink_messages"
             )
+            # Most packages do not ship prelink messages; avoid globbing a
+            # definitely absent directory for every package in the transaction.
+            if not prelink_msg_dir.is_dir():
+                continue
             all_msg_subdir = list(
                 item for item in prelink_msg_dir.glob("**/*") if item.is_file()
             )
-            if prelink_msg_dir.is_dir() and all_msg_subdir:
+            if all_msg_subdir:
                 print("\n\nThe following PRELINK MESSAGES are INCLUDED:\n\n")
                 flag_pre_link = True
 
@@ -559,6 +572,9 @@ class UnlinkLinkTransaction:
                     specs,
                     all_link_path_actions,
                 )
+            )
+            link_action_groups[-1] = link_ag._replace(
+                actions=cls._aggregate_link_actions(link_ag.actions)
             )
 
         prefix_record_groups = [ActionGroup("record", None, record_axns, target_prefix)]
@@ -971,12 +987,16 @@ class UnlinkLinkTransaction:
                         is_unlink = axngroup.type == "unlink"
                         target_prefix = axngroup.target_prefix
                         prec = axngroup.pkg_data
-                        run_script(
-                            target_prefix if is_unlink else prec.extracted_package_dir,
-                            prec,
-                            "pre-unlink" if is_unlink else "pre-link",
-                            target_prefix,
-                        )
+                        action = "pre-unlink" if is_unlink else "pre-link"
+                        if _package_metadata_includes_script(prec, action):
+                            run_script(
+                                target_prefix
+                                if is_unlink
+                                else prec.extracted_package_dir,
+                                prec,
+                                action,
+                                target_prefix,
+                            )
 
                     # parallel block 1:
                     for exc in self.execute_executor.map(
@@ -1138,12 +1158,13 @@ class UnlinkLinkTransaction:
         target_prefix = axngroup.target_prefix
         is_unlink = axngroup.type == "unlink"
         prec = axngroup.pkg_data
-        if prec:
+        action = "post-unlink" if is_unlink else "post-link"
+        if prec and _package_metadata_includes_script(prec, action):
             try:
                 run_script(
                     target_prefix,
                     prec,
-                    "post-unlink" if is_unlink else "post-link",
+                    action,
                     activate=True,
                 )
             except Exception as e:  # this won't be a multi error
@@ -1267,6 +1288,52 @@ class UnlinkLinkTransaction:
             *create_directory_actions,
             *file_link_actions,
         )
+
+    @staticmethod
+    def _aggregate_link_actions(actions):
+        directory_actions = []
+        clone_actions = []
+        remaining_actions = []
+        blocked_paths = []
+        for action in actions:
+            # PrefixReplaceLinkAction is a LinkPathAction subclass, but it must
+            # keep its own prefix rewrite and codesign verify/execute path.
+            plain_link_action = type(action) is LinkPathAction
+            if plain_link_action and action.link_type == LinkType.directory:
+                directory_actions.append(action)
+            elif plain_link_action and action.link_type == LinkType.clone:
+                clone_actions.append(action)
+            else:
+                remaining_actions.append(action)
+                if getattr(action, "target_short_path", None):
+                    blocked_paths.append(action.target_short_path)
+
+        if clone_actions:
+            # CreatePrefixRecordAction keeps the original path actions; this
+            # only swaps the execution action group for the link phase.
+            actions = (
+                BulkClonePathAction(directory_actions, clone_actions, blocked_paths),
+                *remaining_actions,
+            )
+
+        bulkable_actions = []
+        aggregate_actions = []
+        for action in actions:
+            plain_link_action = type(action) is LinkPathAction
+            if plain_link_action and action.link_type == LinkType.hardlink:
+                bulkable_actions.append(action)
+            else:
+                if len(bulkable_actions) > 1:
+                    aggregate_actions.append(BulkHardLinkPathAction(*bulkable_actions))
+                else:
+                    aggregate_actions.extend(bulkable_actions)
+                bulkable_actions = []
+                aggregate_actions.append(action)
+        if len(bulkable_actions) > 1:
+            aggregate_actions.append(BulkHardLinkPathAction(*bulkable_actions))
+        else:
+            aggregate_actions.extend(bulkable_actions)
+        return tuple(aggregate_actions)
 
     @staticmethod
     def _make_entry_point_actions(
@@ -1576,6 +1643,24 @@ class UnlinkLinkTransaction:
             revised_precs,
         )
         return change_report
+
+
+def _package_metadata_includes_script(prec, action: str) -> bool:
+    script_name = f".{prec.name}-{action}.{'bat' if on_win else 'sh'}"
+    script_path = f"{BIN_DIRECTORY}/{script_name}"
+
+    paths_data = getattr(prec, "paths_data", None)
+    paths = getattr(paths_data, "paths", None)
+    if paths is not None:
+        return any(path_data.path == script_path for path_data in paths)
+
+    files = getattr(prec, "files", None)
+    if files:
+        return script_path in files
+
+    # Older or partial records may not expose path metadata; keep the legacy
+    # run_script probe rather than incorrectly skipping a user script.
+    return True
 
 
 def run_script(

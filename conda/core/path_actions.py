@@ -20,7 +20,7 @@ from ..base.constants import CONDA_TEMP_EXTENSION, WINDOWS_LAUNCHER_STUB_PATH
 from ..base.context import context
 from ..common.compat import on_win
 from ..common.constants import TRACE
-from ..common.io import dashlist
+from ..common.io import ThreadLimitedThreadPoolExecutor, dashlist
 from ..common.path import (
     BIN_DIRECTORY,
     get_leaf_directories,
@@ -42,6 +42,8 @@ from ..exceptions import (
 )
 from ..gateways.connection.download import download
 from ..gateways.disk.create import (
+    HardLinkPathExecutor,
+    clone_directory,
     compile_multiple_pyc,
     copy,
     create_hard_link_or_copy,
@@ -68,7 +70,12 @@ from ..models.records import (
     PrefixRecord,
 )
 from .envs_manager import get_user_environments_txt_file, register_env, unregister_env
-from .portability import _PaddingError, update_prefix
+from .portability import (
+    _PaddingError,
+    codesign_paths,
+    needs_osx_arm64_codesign,
+    update_prefix,
+)
 from .prefix_data import PrefixData
 
 if TYPE_CHECKING:
@@ -82,6 +89,8 @@ except NameError:
 log = getLogger(__name__)
 
 _MENU_RE = re.compile(r"^menu/.*\.json$", re.IGNORECASE)
+PARALLEL_PATH_ACTION_THRESHOLD = 64
+PARALLEL_PATH_ACTION_WORKERS = 8
 REPR_IGNORE_KWARGS = (
     "transaction_context",
     "package_info",
@@ -531,6 +540,246 @@ class LinkPathAction(CreateInPrefixPathAction):
                 rm_rf(self.target_full_path, clean_empty_parents=True)
 
 
+class BulkHardLinkPathAction(MultiPathAction):
+    def __init__(self, *link_path_actions):
+        self._link_path_actions = link_path_actions
+        self.transaction_context = link_path_actions[0].transaction_context
+        self.package_info = link_path_actions[0].package_info
+        self.target_prefix = link_path_actions[0].target_prefix
+        self.target_short_paths = tuple(
+            action.target_short_path for action in link_path_actions
+        )
+        self._execute_successful = False
+
+    @property
+    def target_full_paths(self):
+        return tuple(action.target_full_path for action in self._link_path_actions)
+
+    def verify(self):
+        for action in self._link_path_actions:
+            if action.verified:
+                continue
+            error = action.verify()
+            if error:
+                return error
+        self._verified = True
+
+    def execute(self):
+        log.log(TRACE, "bulk hard linking %d paths", len(self._link_path_actions))
+        with HardLinkPathExecutor(force=context.force) as link_executor:
+            for action in self._link_path_actions:
+                # The wrapped LinkPathAction still owns verify, rollback, and
+                # conda-meta data; the bulk action only reuses syscall setup.
+                link_executor.link_or_copy(
+                    action.source_full_path,
+                    action.target_full_path,
+                )
+                action._execute_successful = True
+        self._execute_successful = True
+
+    def reverse(self):
+        if any(action._execute_successful for action in self._link_path_actions):
+            log.log(TRACE, "reversing bulk hard link creation %s", self.target_prefix)
+            for action in reversed(self._link_path_actions):
+                action.reverse()
+
+    def cleanup(self):
+        for action in self._link_path_actions:
+            action.cleanup()
+
+
+def _path_parts(path):
+    return tuple(part for part in path.replace("\\", "/").split("/") if part)
+
+
+def _parts_to_path(parts):
+    return "/".join(parts)
+
+
+def _parts_start_with(path_parts, prefix_parts):
+    return path_parts[: len(prefix_parts)] == prefix_parts
+
+
+class BulkClonePathAction(MultiPathAction):
+    def __init__(self, directory_actions, link_path_actions, blocked_short_paths=()):
+        self._directory_actions = tuple(directory_actions)
+        self._link_path_actions = tuple(link_path_actions)
+        self._blocked_short_paths = {
+            _path_parts(path) for path in blocked_short_paths if path
+        }
+        self.transaction_context = link_path_actions[0].transaction_context
+        self.package_info = link_path_actions[0].package_info
+        self.target_prefix = link_path_actions[0].target_prefix
+        self.target_short_paths = tuple(
+            action.target_short_path for action in link_path_actions
+        )
+        self._clone_directory_parts = self._find_clone_directory_parts()
+        self._execute_successful = False
+
+    @property
+    def target_full_paths(self):
+        return tuple(action.target_full_path for action in self._link_path_actions)
+
+    def verify(self):
+        for action in chain(self._directory_actions, self._link_path_actions):
+            if action.verified:
+                continue
+            error = action.verify()
+            if error:
+                return error
+        self._verified = True
+
+    def execute(self):
+        log.log(
+            TRACE,
+            "bulk clone linking %d paths from %s",
+            len(self._link_path_actions),
+            self.package_info.extracted_package_dir,
+        )
+        covered_actions = set()
+        for directory_parts in self._clone_directory_parts:
+            clone_actions = tuple(
+                action
+                for action in self._link_path_actions
+                if action not in covered_actions
+                and _parts_start_with(
+                    _path_parts(action.target_short_path), directory_parts
+                )
+            )
+            if not clone_actions:
+                continue
+
+            source_dir = join(
+                self.package_info.extracted_package_dir,
+                win_path_ok(_parts_to_path(directory_parts)),
+            )
+            target_dir = join(
+                self.target_prefix, win_path_ok(_parts_to_path(directory_parts))
+            )
+            if lexists(target_dir):
+                continue
+            # Directory clones are only safe when the manifest exactly covers
+            # the source subtree; otherwise individual LinkPathActions run.
+            if not self._source_tree_matches_actions(
+                source_dir, directory_parts, clone_actions
+            ):
+                continue
+
+            mkdir_p(dirname(target_dir))
+            if clone_directory(source_dir, target_dir):
+                self._touch_cloned_python_import_dirs(directory_parts, target_dir)
+                for action in clone_actions:
+                    action._execute_successful = True
+                covered_actions.update(clone_actions)
+
+        # Keep explicit directory actions in the normal transaction stream so
+        # their verify/rollback behavior is unchanged after a successful clone.
+        for action in self._directory_actions:
+            action.execute()
+
+        remaining_actions = tuple(
+            action
+            for action in self._link_path_actions
+            if action not in covered_actions
+        )
+        # Leftover clone actions are the fallback tail after directory clones.
+        # On non-APFS platforms determine_link_type never selects LinkType.clone.
+        workers = (
+            1
+            if context.debug or len(remaining_actions) < PARALLEL_PATH_ACTION_THRESHOLD
+            else min(
+                PARALLEL_PATH_ACTION_WORKERS,
+                os.cpu_count() or 1,
+                len(remaining_actions),
+            )
+        )
+        if workers == 1:
+            for action in remaining_actions:
+                action.execute()
+        else:
+            with ThreadLimitedThreadPoolExecutor(workers) as executor:
+                futures = tuple(
+                    executor.submit(action.execute) for action in remaining_actions
+                )
+                for future in futures:
+                    future.result()
+        self._execute_successful = True
+
+    def reverse(self):
+        if any(action._execute_successful for action in self._link_path_actions):
+            log.log(TRACE, "reversing bulk clone creation %s", self.target_prefix)
+            for action in reversed(self._link_path_actions):
+                action.reverse()
+        for action in reversed(self._directory_actions):
+            action.reverse()
+
+    def cleanup(self):
+        for action in chain(self._directory_actions, self._link_path_actions):
+            action.cleanup()
+
+    def _find_clone_directory_parts(self):
+        cloneable_paths = {
+            _path_parts(action.target_short_path) for action in self._link_path_actions
+        }
+        candidate_parts = set()
+        for path_parts in cloneable_paths:
+            for index in range(1, len(path_parts)):
+                candidate = path_parts[:index]
+                # A non-plain action under a subtree can require prefix rewrite,
+                # menu handling, or another side effect that a directory clone skips.
+                if not any(
+                    _parts_start_with(blocked_path, candidate)
+                    for blocked_path in self._blocked_short_paths
+                ):
+                    candidate_parts.add(candidate)
+
+        return tuple(sorted(candidate_parts, key=lambda parts: (len(parts), parts)))
+
+    def _touch_cloned_python_import_dirs(self, directory_parts, target_dir):
+        site_packages = self.transaction_context.get("target_site_packages_short_path")
+        if not site_packages:
+            return
+
+        # clonefile preserves source directory mtimes; touch import roots so
+        # Python's directory caches see newly installed modules immediately.
+        site_packages_parts = _path_parts(site_packages)
+        touch_paths = []
+        if _parts_start_with(site_packages_parts, directory_parts):
+            touch_paths.append(join(self.target_prefix, win_path_ok(site_packages)))
+        elif _parts_start_with(directory_parts, site_packages_parts):
+            touch_paths.append(target_dir)
+            touch_paths.append(join(self.target_prefix, win_path_ok(site_packages)))
+
+        for touch_path in touch_paths:
+            if isdir(touch_path):
+                touch(touch_path)
+
+    def _source_tree_matches_actions(self, source_dir, directory_parts, clone_actions):
+        if not isdir(source_dir):
+            return False
+
+        expected = {
+            _parts_to_path(
+                _path_parts(action.source_short_path)[len(directory_parts) :]
+            )
+            for action in clone_actions
+        }
+        actual = set()
+        for root, dirs, files in os.walk(source_dir):
+            # A symlinked directory could pull in files outside the manifest.
+            if any(islink(join(root, directory)) for directory in dirs):
+                return False
+            relative_root = os.path.relpath(root, source_dir)
+            for filename in files:
+                relative_path = (
+                    filename if relative_root == "." else f"{relative_root}/{filename}"
+                )
+                actual.add(relative_path.replace(os.sep, "/"))
+                if relative_path.replace(os.sep, "/") not in expected:
+                    return False
+        return actual == expected
+
+
 class PrefixReplaceLinkAction(LinkPathAction):
     def __init__(
         self,
@@ -561,7 +810,7 @@ class PrefixReplaceLinkAction(LinkPathAction):
         self.file_mode = file_mode
         self.intermediate_path = None
 
-    def verify(self):
+    def verify(self, *, queue_codesign=True):
         validation_error = super().verify()
         if validation_error:
             return validation_error
@@ -590,21 +839,38 @@ class PrefixReplaceLinkAction(LinkPathAction):
 
         try:
             log.log(TRACE, "rewriting prefixes in %s", self.target_full_path)
-            update_prefix(
+            should_hash = context.extra_safety_checks
+            update_result = update_prefix(
                 self.intermediate_path,
                 context.target_prefix_override or self.target_prefix,
                 self.prefix_placeholder,
                 self.file_mode,
                 subdir=self.package_info.repodata_record.subdir,
+                sign_binary=False,
+                return_sha256=should_hash,
             )
+            if should_hash:
+                updated, sha256_in_prefix = update_result
+            else:
+                updated = update_result
+                sha256_in_prefix = None
+            if updated and needs_osx_arm64_codesign(
+                self.file_mode, self.package_info.repodata_record.subdir
+            ):
+                # Normal transaction verify batches all rewritten binaries; a
+                # lazy verify during execute must sign before the file is linked.
+                if queue_codesign:
+                    self.transaction_context.setdefault(
+                        "osx_arm64_codesign_paths", []
+                    ).append(self.intermediate_path)
+                else:
+                    codesign_paths((self.intermediate_path,))
         except _PaddingError:
             raise PaddingError(
                 self.target_full_path,
                 self.prefix_placeholder,
                 len(self.prefix_placeholder),
             )
-
-        sha256_in_prefix = compute_sum(self.intermediate_path, "sha256")
 
         self.prefix_path_data = PathDataV1.from_objects(
             self.prefix_path_data,
@@ -618,7 +884,7 @@ class PrefixReplaceLinkAction(LinkPathAction):
 
     def execute(self):
         if not self._verified:
-            self.verify()
+            self.verify(queue_codesign=False)
         source_path = self.intermediate_path or self.source_full_path
         log.log(TRACE, "linking %s => %s", source_path, self.target_full_path)
         create_link(source_path, self.target_full_path, self.link_type)
@@ -983,9 +1249,16 @@ class CreatePrefixRecordAction(CreateInPrefixPathAction):
         self._execute_successful = False
 
     def execute(self):
+        requested_link_type = (
+            LinkType.copy
+            if self.requested_link_type == LinkType.clone
+            else self.requested_link_type
+        )
+        # LinkType.clone is an install-time CoW optimization, not a persisted
+        # prefix metadata mode. Record it as copy so older tooling is unaffected.
         link = Link(
             source=self.package_info.extracted_package_dir,
-            type=self.requested_link_type,
+            type=requested_link_type,
         )
         extracted_package_dir = self.package_info.extracted_package_dir
         package_tarball_full_path = self.package_info.package_tarball_full_path
