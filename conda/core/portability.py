@@ -8,8 +8,10 @@ import os
 import re
 import struct
 import subprocess
+from hashlib import sha256
 from logging import getLogger
 from os.path import basename, realpath
+from typing import TYPE_CHECKING
 
 from ..auxlib.ish import dals
 from ..base.constants import PREFIX_PLACEHOLDER
@@ -20,6 +22,9 @@ from ..gateways.disk.update import CancelOperation, update_file_in_place_as_bina
 from ..models.enums import FileMode
 
 log = getLogger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 # three capture groups: whole_shebang, executable, options
@@ -43,6 +48,8 @@ POPULAR_ENCODINGS = (
     "utf-32-le",
     "utf-32-be",
 )
+_CODESIGN_COMMAND = ("/usr/bin/codesign", "-s", "-", "-f")
+_CODESIGN_MAX_COMMAND_BYTES = 128 * 1024
 
 
 class _PaddingError(Exception):
@@ -73,7 +80,10 @@ def update_prefix(
     placeholder: str = PREFIX_PLACEHOLDER,
     mode: FileMode = FileMode.text,
     subdir: str = context.subdir,
-) -> None:
+    *,
+    sign_binary: bool = True,
+    return_sha256: bool = False,
+) -> bool | tuple[bool, str | None]:
     """
     Update the prefix in a file or directory.
 
@@ -89,6 +99,8 @@ def update_prefix(
         # replace with unix-style path separators
         new_prefix = new_prefix.replace("\\", "/")
 
+    updated_sha256 = None
+
     def _update_prefix(original_data):
         """
         A function that updates the prefix in a file or directory.
@@ -99,6 +111,8 @@ def update_prefix(
         Returns:
             The updated data after prefix replacement.
         """
+        nonlocal updated_sha256
+
         # Step 1. do all prefix replacement
         data = replace_prefix(mode, original_data, placeholder, new_prefix, subdir)
 
@@ -108,6 +122,11 @@ def update_prefix(
             data = replace_long_shebang(mode, data)
 
         # Step 3. if the before and after content is the same, skip writing
+        # sha256_in_prefix is only consumed by extra safety checks; keep the
+        # default install path from paying this CPU cost.
+        if return_sha256:
+            updated_sha256 = sha256(data).hexdigest()
+
         if data == original_data:
             raise CancelOperation()
 
@@ -122,11 +141,42 @@ def update_prefix(
 
     updated = update_file_in_place_as_binary(realpath(path), _update_prefix)
 
-    if updated and mode == FileMode.binary and subdir == "osx-arm64" and on_mac:
-        # Apple arm64 needs signed executables
-        subprocess.run(
-            ["/usr/bin/codesign", "-s", "-", "-f", realpath(path)], capture_output=True
-        )
+    if updated and sign_binary and needs_osx_arm64_codesign(mode, subdir):
+        codesign_paths((realpath(path),))
+
+    return (updated, updated_sha256) if return_sha256 else updated
+
+
+def needs_osx_arm64_codesign(mode: FileMode, subdir: str) -> bool:
+    return mode == FileMode.binary and subdir == "osx-arm64" and on_mac
+
+
+def _iter_codesign_batches(
+    paths: Iterable[str],
+    max_command_bytes: int = _CODESIGN_MAX_COMMAND_BYTES,
+) -> Iterable[tuple[str, ...]]:
+    # Keep batched invocations below Darwin's command-line size limit; the
+    # paths here are fully-qualified intermediate files and can be long.
+    base_size = sum(len(os.fsencode(argument)) + 1 for argument in _CODESIGN_COMMAND)
+    batch = []
+    batch_size = base_size
+
+    for path in paths:
+        path_size = len(os.fsencode(path)) + 1
+        if batch and batch_size + path_size > max_command_bytes:
+            yield tuple(batch)
+            batch = []
+            batch_size = base_size
+        batch.append(path)
+        batch_size += path_size
+
+    if batch:
+        yield tuple(batch)
+
+
+def codesign_paths(paths: Iterable[str]) -> None:
+    for batch in _iter_codesign_batches(paths):
+        subprocess.run([*_CODESIGN_COMMAND, *batch], capture_output=True)
 
 
 def replace_prefix(

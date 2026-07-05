@@ -2,15 +2,18 @@
 # SPDX-License-Identifier: BSD-3-Clause
 import os
 import re
+from hashlib import sha256
 
 import pytest
 
 from conda.auxlib.ish import dals
 from conda.base.constants import PREFIX_PLACEHOLDER
 from conda.common.compat import on_win
+from conda.core import portability
 from conda.core.portability import (
     MAX_SHEBANG_LENGTH,
     SHEBANG_REGEX,
+    _iter_codesign_batches,
     replace_long_shebang,
     update_prefix,
 )
@@ -148,3 +151,100 @@ def test_escaped_prefix_replaced_only_shebang(tmp_path):
                 assert line.startswith("#!/usr/bin/env python")
             elif i == 1:
                 assert new_prefix in line
+
+
+def test_update_prefix_can_defer_osx_arm64_codesign(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(portability, "on_mac", True)
+    monkeypatch.setattr(
+        portability, "update_file_in_place_as_binary", lambda *args: True
+    )
+    monkeypatch.setattr(
+        portability,
+        "codesign_paths",
+        lambda paths: pytest.fail("codesign should be deferred"),
+    )
+
+    updated = update_prefix(
+        "/unused",
+        "/prefix",
+        mode=FileMode.binary,
+        subdir="osx-arm64",
+        sign_binary=False,
+    )
+
+    assert updated is True
+
+
+def test_update_prefix_can_return_updated_sha256(tmp_path):
+    script = tmp_path / "script"
+    script.write_bytes(f"#!{PREFIX_PLACEHOLDER}/python\n".encode())
+
+    updated, updated_sha256 = update_prefix(
+        path=str(script),
+        new_prefix="/opt/demo",
+        placeholder=PREFIX_PLACEHOLDER,
+        return_sha256=True,
+    )
+
+    assert updated is True
+    assert updated_sha256 == sha256(script.read_bytes()).hexdigest()
+
+
+def test_update_prefix_does_not_hash_unless_requested(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    script = tmp_path / "script"
+    script.write_bytes(f"#!{PREFIX_PLACEHOLDER}/python\n".encode())
+    monkeypatch.setattr(
+        portability,
+        "sha256",
+        lambda *args, **kwargs: pytest.fail("sha256 should not be computed"),
+    )
+
+    assert (
+        update_prefix(
+            path=str(script),
+            new_prefix="/opt/demo",
+            placeholder=PREFIX_PLACEHOLDER,
+        )
+        is True
+    )
+
+
+def test_iter_codesign_batches_limits_command_size():
+    paths = ("a", "b" * 10, "c" * 10)
+
+    def command_arg_size(argument):
+        return len(os.fsencode(argument)) + 1
+
+    max_command_bytes = (
+        sum(command_arg_size(argument) for argument in portability._CODESIGN_COMMAND)
+        + command_arg_size(paths[0])
+        + command_arg_size(paths[1])
+    )
+
+    assert list(_iter_codesign_batches(paths, max_command_bytes)) == [
+        paths[:2],
+        paths[2:],
+    ]
+
+
+def test_codesign_paths_runs_each_batch(mocker):
+    run = mocker.patch("conda.core.portability.subprocess.run")
+    mocker.patch(
+        "conda.core.portability._iter_codesign_batches",
+        return_value=(("one", "two"), ("three",)),
+    )
+
+    portability.codesign_paths(("one", "two", "three"))
+
+    assert run.call_args_list == [
+        mocker.call(
+            ["/usr/bin/codesign", "-s", "-", "-f", "one", "two"],
+            capture_output=True,
+        ),
+        mocker.call(
+            ["/usr/bin/codesign", "-s", "-", "-f", "three"],
+            capture_output=True,
+        ),
+    ]
