@@ -2,14 +2,19 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Disk utility functions for creating new files or directories."""
 
+import errno
 import os
 import sys
 import tempfile
 import warnings as _warnings
-from errno import EACCES, EPERM, EROFS
+from collections import OrderedDict
+from ctypes import CDLL, c_char_p, c_int, get_errno
+from errno import EACCES, ENOSYS, EPERM, EROFS, EXDEV
+from functools import cache
 from logging import getLogger
-from os.path import dirname, isdir, isfile, join, splitext
+from os.path import basename, dirname, isdir, isfile, join, splitext
 from shutil import copyfileobj, copystat
+from uuid import uuid4
 
 from ... import CondaError
 from ...auxlib.ish import dals
@@ -90,6 +95,20 @@ deprecated.constant(
     getLogger("conda.stdoutlog"),
     addendum="Use `conda.gateways.streams.stdoutlog` instead.",
 )
+
+_CLONEFILE_UNSUPPORTED_ERRNOS = frozenset(
+    error
+    for error in (
+        EXDEV,
+        ENOSYS,
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+    )
+    if error is not None
+)
+_CLONEFILE_UNSUPPORTED_DEVICES: set[tuple[int, int]] = set()
+_CLONEFILE_UNAVAILABLE = object()
+_CLONEFILE = None
 
 # in __init__.py to help with circular imports
 mkdir_p = mkdir_p
@@ -322,7 +341,102 @@ def copy(src, dst):
             log.log(TRACE, "soft linking %s => %s", src, dst)
             symlink(src_points_to, dst)
             return
+    # APFS clonefile gives copy-on-write semantics for normal copy requests.
+    # Unsupported filesystems fall through to the byte-copy path below.
+    if _clone_file(src, dst):
+        try:
+            copystat(src, dst)
+        except OSError as e:  # pragma: no cover
+            log.debug("%r", e)
+        return
     _do_copy(src, dst)
+
+
+def clone_link_or_copy(src, dst):
+    if _clone_file(src, dst):
+        return
+    # A requested clone is best-effort. Hardlink is the next cheapest safe
+    # install mode for files; directories and failed hardlinks fall back to copy.
+    if not isdir(src):
+        try:
+            log.log(TRACE, "hard linking %s => %s", src, dst)
+            link(src, dst)
+            return
+        except OSError as e:
+            log.debug("%r", e)
+            log.debug(
+                "clone and hard-link failed. falling back to copy\n"
+                "  error: %r\n"
+                "  src: %s\n"
+                "  dst: %s",
+                e,
+                src,
+                dst,
+            )
+    _do_copy(src, dst)
+
+
+def clone_directory(src, dst):
+    if not isdir(src) or lexists(dst):
+        return False
+    return _clone_file(src, dst)
+
+
+@cache
+def clone_file_supported(source_file, dest_dir):
+    test_file = join(dest_dir, f".tmp.clone.{basename(source_file)}.{str(uuid4())[:8]}")
+    if not isfile(source_file):
+        raise OSError(f"Path {source_file} is not a file")
+    if not isdir(dest_dir):
+        raise OSError(f"Path {dest_dir} is not a directory")
+    if lexists(test_file):
+        rm_rf(test_file)
+    if lexists(test_file):
+        raise OSError(f"{test_file} should not exist anymore")
+    try:
+        return _clone_file(source_file, test_file)
+    finally:
+        rm_rf(test_file)
+
+
+def _clone_file(src, dst):
+    if sys.platform != "darwin" or islink(src):
+        return False
+    try:
+        src_dev = os.stat(src).st_dev
+        dst_dev = os.stat(dirname(dst) or ".").st_dev
+    except OSError:
+        return False
+    device_pair = (src_dev, dst_dev)
+    if device_pair in _CLONEFILE_UNSUPPORTED_DEVICES:
+        return False
+
+    global _CLONEFILE
+    # Resolve clonefile lazily so importing conda stays portable and cheap.
+    if _CLONEFILE is _CLONEFILE_UNAVAILABLE:
+        return False
+    if _CLONEFILE is None:
+        try:
+            clonefile = CDLL(None, use_errno=True).clonefile
+        except AttributeError:
+            _CLONEFILE = _CLONEFILE_UNAVAILABLE
+            return False
+        clonefile.argtypes = (c_char_p, c_char_p, c_int)
+        clonefile.restype = c_int
+        _CLONEFILE = clonefile
+
+    if _CLONEFILE(os.fsencode(src), os.fsencode(dst), 0) == 0:
+        log.log(TRACE, "cloning %s => %s", src, dst)
+        return True
+    errno = get_errno()
+    log.debug("clonefile failed with errno %s for %s => %s", errno, src, dst)
+    if errno in _CLONEFILE_UNSUPPORTED_ERRNOS:
+        # Cross-device and unsupported filesystem failures are stable for this
+        # source/destination pair; skip repeated clonefile probes.
+        _CLONEFILE_UNSUPPORTED_DEVICES.add(device_pair)
+    if lexists(dst):
+        rm_rf(dst)
+    return False
 
 
 def _do_copy(src, dst):
@@ -344,6 +458,50 @@ def _do_copy(src, dst):
         # shutil.copystat gives a permission denied when using the os.setxattr function
         # on the security.selinux property.
         log.debug("%r", e)
+
+
+class HardLinkPathExecutor:
+    def __init__(self, force=False):
+        self._force = force
+        self._dir_fds = OrderedDict()
+        # dir_fd avoids repeated absolute-path resolution in large hardlink batches.
+        self._use_dir_fds = not on_win and os.link in os.supports_dir_fd and not force
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        while self._dir_fds:
+            _, fd = self._dir_fds.popitem()
+            os.close(fd)
+
+    def _get_dir_fd(self, directory):
+        directory = directory or "."
+        try:
+            fd = self._dir_fds.pop(directory)
+        except KeyError:
+            if len(self._dir_fds) >= 64:
+                _, old_fd = self._dir_fds.popitem(last=False)
+                os.close(old_fd)
+            fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        self._dir_fds[directory] = fd
+        return fd
+
+    def link_or_copy(self, src, dst):
+        if self._use_dir_fds and not isdir(src):
+            try:
+                log.log(TRACE, "hard linking %s => %s", src, dst)
+                os.link(
+                    basename(src),
+                    basename(dst),
+                    src_dir_fd=self._get_dir_fd(dirname(src)),
+                    dst_dir_fd=self._get_dir_fd(dirname(dst)),
+                )
+                return
+            except OSError as e:
+                log.debug("%r", e)
+
+        create_link(src, dst, LinkType.hardlink, force=self._force)
 
 
 def create_link(src, dst, link_type=LinkType.hardlink, force=False):
@@ -389,6 +547,9 @@ def create_link(src, dst, link_type=LinkType.hardlink, force=False):
             )
 
             copy(src, dst)
+            return
+    elif link_type == LinkType.clone:
+        clone_link_or_copy(src, dst)
     elif link_type == LinkType.softlink:
         _do_softlink(src, dst)
     elif link_type == LinkType.copy:
@@ -407,17 +568,16 @@ def compile_multiple_pyc(
 
     fd, filename = tempfile.mkstemp()
     try:
-        for f in py_full_paths:
-            f = os.path.relpath(f, prefix)
-            if hasattr(f, "encode"):
-                f = f.encode(sys.getfilesystemencoding(), errors="replace")
-            os.write(fd, f + b"\n")
+        pyc_pairs = tuple(
+            (
+                os.path.relpath(py_full_path, prefix),
+                os.path.relpath(pyc_full_path, prefix),
+            )
+            for py_full_path, pyc_full_path in zip(py_full_paths, pyc_full_paths)
+        )
+        os.write(fd, json.dumps(pyc_pairs).encode("utf-8"))
         os.close(fd)
-        command = ["-Wi", "-m", "compileall", "-q", "-l", "-i", filename]
-        # if the python version in the prefix is 3.5+, we have some extra args.
-        #    -j 0 will do the compilation in parallel, with os.cpu_count() cores
-        if int(py_ver[0]) >= 3 and int(py_ver.split(".")[1]) > 5:
-            command.extend(["-j", "0"])
+        command = ["-Wi", "-c", _COMPILE_PYC_SCRIPT, filename]
         command[0:0] = [python_exe_full_path]
         # command[0:0] = ['--cwd', prefix, '--dev', '-p', prefix, python_exe_full_path]
         log.log(TRACE, command)
@@ -459,6 +619,33 @@ def compile_multiple_pyc(
             created_pyc_paths.append(pyc_full_path)
 
     return created_pyc_paths
+
+
+_COMPILE_PYC_SCRIPT = r"""
+import errno
+import io
+import json
+import os
+import py_compile
+import sys
+import traceback
+
+with io.open(sys.argv[1], encoding="utf-8") as fh:
+    pairs = json.load(fh)
+
+for py_full_path, pyc_full_path in pairs:
+    try:
+        pyc_dir = os.path.dirname(pyc_full_path)
+        if pyc_dir and not os.path.isdir(pyc_dir):
+            try:
+                os.makedirs(pyc_dir)
+            except OSError as exc:
+                if exc.errno != errno.EEXIST:
+                    raise
+        py_compile.compile(py_full_path, cfile=pyc_full_path, doraise=True)
+    except Exception:
+        traceback.print_exc()
+"""
 
 
 def create_package_cache_directory(pkgs_dir):

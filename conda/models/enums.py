@@ -66,12 +66,13 @@ class FileMode(Enum):
 
 
 class LinkType(Enum):
-    # directory is not a link type, and copy is not a path type
+    # directory and clone are not path types, and copy is not a path type
     # LinkType is still probably the best name here
     hardlink = 1
     softlink = 2
     copy = 3
     directory = 4
+    clone = 5
 
     def __int__(self):
         return self.value
