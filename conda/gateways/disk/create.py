@@ -613,7 +613,7 @@ def compile_multiple_pyc(
     if len(py_full_paths) == 0:
         return []
 
-    fd, filename = tempfile.mkstemp()
+    temp_files = []
     try:
         pyc_pairs = tuple(
             (
@@ -622,10 +622,19 @@ def compile_multiple_pyc(
             )
             for py_full_path, pyc_full_path in zip(py_full_paths, pyc_full_paths)
         )
-        os.write(fd, json.dumps(pyc_pairs).encode("utf-8"))
-        os.close(fd)
-        command = ["-Wi", "-c", _COMPILE_PYC_SCRIPT, filename]
-        command[0:0] = [python_exe_full_path]
+        pairs_fd, pairs_filename = tempfile.mkstemp()
+        temp_files.append(pairs_filename)
+        with os.fdopen(pairs_fd, "w", encoding="utf-8") as fh:
+            json.dump(pyc_pairs, fh)
+
+        script_fd, script_filename = tempfile.mkstemp(suffix=".py")
+        temp_files.append(script_filename)
+        with os.fdopen(script_fd, "w", encoding="utf-8") as fh:
+            fh.write(_COMPILE_PYC_SCRIPT)
+
+        # Windows wrapper scripts reject newline-containing arguments, so run the
+        # paired compiler from a temporary file instead of passing it via -c.
+        command = [python_exe_full_path, "-Wi", script_filename, pairs_filename]
         # command[0:0] = ['--cwd', prefix, '--dev', '-p', prefix, python_exe_full_path]
         log.log(TRACE, command)
         from ..subprocess import any_subprocess
@@ -637,7 +646,11 @@ def compile_multiple_pyc(
         #     stdout, stderr, rc = run_command(Commands.RUN, *command)
         stdout, stderr, rc = any_subprocess(command, prefix)
     finally:
-        os.remove(filename)
+        for filename in temp_files:
+            try:
+                os.remove(filename)
+            except FileNotFoundError:
+                pass
 
     created_pyc_paths = []
     for py_full_path, pyc_full_path in zip(py_full_paths, pyc_full_paths):

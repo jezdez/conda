@@ -264,10 +264,14 @@ def test_compile_multiple_pyc_uses_direct_pair_compiler(
     calls = []
 
     def fake_any_subprocess(command, command_prefix):
-        calls.append((command, command_prefix))
-        assert command[1:3] == ["-Wi", "-c"]
+        script = Path(command[2]).read_text()
+        pairs = json.loads(Path(command[3]).read_text())
+        calls.append((command, command_prefix, script, pairs))
+        assert command[1] == "-Wi"
+        assert "-c" not in command
+        assert all("\n" not in arg for arg in command)
         assert "compileall" not in command
-        pairs = json.loads(Path(command[-1]).read_text())
+        assert "compileall" not in script
         assert pairs == [
             [
                 str(Path("lib/python3.12/site-packages/demo.py")),
@@ -298,11 +302,22 @@ def test_compile_multiple_pyc_uses_direct_pair_compiler(
             [
                 "/prefix/bin/python",
                 "-Wi",
-                "-c",
-                create._COMPILE_PYC_SCRIPT,
-                calls[0][0][-1],
+                calls[0][0][2],
+                calls[0][0][3],
             ],
             str(prefix),
+            create._COMPILE_PYC_SCRIPT,
+            [
+                [
+                    str(Path("lib/python3.12/site-packages/demo.py")),
+                    str(
+                        Path(
+                            "lib/python3.12/site-packages/__pycache__/"
+                            "demo.cpython-312.pyc"
+                        )
+                    ),
+                ]
+            ],
         )
     ]
 
