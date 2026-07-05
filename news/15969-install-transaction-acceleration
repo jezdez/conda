@@ -1,0 +1,3 @@
+### Enhancements
+
+* Speed up macOS package transactions by batching Apple silicon prefix-replacement codesign calls, chunking large codesign batches, reusing prefix-replacement hashes, preferring an internal APFS clone link mode when a clone probe succeeds, cloning safe manifest-covered package directories, parallelizing remaining safe path batches, preferring package-cache entries on the target prefix device, compiling bytecode from exact source/pyc pairs, bulk-linking plain hardlink actions with directory file descriptors, preserving import-directory mtimes after cloned site-packages installs, and avoiding unnecessary pre/post-link script and prelink message probes. (#15969)
