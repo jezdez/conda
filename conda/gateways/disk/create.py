@@ -109,6 +109,8 @@ _CLONEFILE_UNSUPPORTED_ERRNOS = frozenset(
 _CLONEFILE_UNSUPPORTED_DEVICES: set[tuple[int, int]] = set()
 _CLONEFILE_UNAVAILABLE = object()
 _CLONEFILE = None
+_WIN_COPYFILE_UNAVAILABLE = object()
+_WIN_COPYFILE = None
 
 # in __init__.py to help with circular imports
 mkdir_p = mkdir_p
@@ -441,6 +443,13 @@ def _clone_file(src, dst):
 
 def _do_copy(src, dst):
     log.log(TRACE, "copying %s => %s", src, dst)
+    if _win_copy_file(src, dst):
+        try:
+            copystat(src, dst)
+        except OSError as e:  # pragma: no cover
+            log.debug("%r", e)
+        return
+
     # src and dst are always files. So we can bypass some checks that shutil.copy does.
     # Also shutil.copy calls shutil.copymode, which we can skip because we are explicitly
     # calling copystat.
@@ -460,12 +469,42 @@ def _do_copy(src, dst):
         log.debug("%r", e)
 
 
+def _win_copy_file(src, dst):
+    if not on_win:
+        return False
+
+    global _WIN_COPYFILE
+    if _WIN_COPYFILE is _WIN_COPYFILE_UNAVAILABLE:
+        return False
+    if _WIN_COPYFILE is None:
+        try:
+            from ctypes import windll, wintypes
+        except ImportError:
+            _WIN_COPYFILE = _WIN_COPYFILE_UNAVAILABLE
+            return False
+        copy_file = windll.kernel32.CopyFileW
+        copy_file.restype = wintypes.BOOL
+        copy_file.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.BOOL)
+        _WIN_COPYFILE = copy_file
+
+    # CopyFileW keeps the data copy in kernel32 instead of bouncing through
+    # Python's read/write loop. The destination is expected not to exist here.
+    if _WIN_COPYFILE(src, dst, True):
+        log.log(TRACE, "windows copying %s => %s", src, dst)
+        return True
+    if lexists(dst):
+        rm_rf(dst)
+    return False
+
+
 class HardLinkPathExecutor:
     def __init__(self, force=False):
         self._force = force
         self._dir_fds = OrderedDict()
         # dir_fd avoids repeated absolute-path resolution in large hardlink batches.
         self._use_dir_fds = not on_win and os.link in os.supports_dir_fd and not force
+        # Windows lacks dir_fd support here, but can still skip create_link overhead.
+        self._use_windows_direct = on_win and not force
 
     def __enter__(self):
         return self
@@ -488,6 +527,14 @@ class HardLinkPathExecutor:
         return fd
 
     def link_or_copy(self, src, dst):
+        if self._use_windows_direct and not isdir(src):
+            try:
+                log.log(TRACE, "hard linking %s => %s", src, dst)
+                link(src, dst)
+                return
+            except OSError as e:
+                log.debug("%r", e)
+
         if self._use_dir_fds and not isdir(src):
             try:
                 log.log(TRACE, "hard linking %s => %s", src, dst)

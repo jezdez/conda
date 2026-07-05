@@ -111,6 +111,58 @@ def test_copy_caches_unsupported_clonefile_device_pair(
     ]
 
 
+def test_do_copy_uses_windows_copyfile(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.write_text("contents")
+    copy_calls = []
+
+    def copy_file(src, dst, fail_if_exists):
+        copy_calls.append((src, dst, fail_if_exists))
+        copyfile(src, dst)
+        return True
+
+    monkeypatch.setattr(create, "on_win", True)
+    monkeypatch.setattr(create, "_WIN_COPYFILE", copy_file)
+    monkeypatch.setattr(
+        create,
+        "copyfileobj",
+        lambda *args, **kwargs: pytest.fail("CopyFileW should avoid Python copy"),
+    )
+
+    create._do_copy(str(source), str(target))
+
+    assert target.read_text() == "contents"
+    assert copy_calls == [(str(source), str(target), True)]
+
+
+def test_do_copy_cleans_up_failed_windows_copyfile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.write_text("contents")
+    target.write_text("partial")
+    removed = []
+    rm_rf = create.rm_rf
+
+    def copy_file(src, dst, fail_if_exists):
+        return False
+
+    def remove(path):
+        removed.append(path)
+        rm_rf(path)
+
+    monkeypatch.setattr(create, "on_win", True)
+    monkeypatch.setattr(create, "_WIN_COPYFILE", copy_file)
+    monkeypatch.setattr(create, "rm_rf", remove)
+
+    create._do_copy(str(source), str(target))
+
+    assert target.read_text() == "contents"
+    assert removed == [str(target)]
+
+
 def test_clone_link_or_copy_falls_back_to_hardlink(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
@@ -218,8 +270,12 @@ def test_compile_multiple_pyc_uses_direct_pair_compiler(
         pairs = json.loads(Path(command[-1]).read_text())
         assert pairs == [
             [
-                "lib/python3.12/site-packages/demo.py",
-                "lib/python3.12/site-packages/__pycache__/demo.cpython-312.pyc",
+                str(Path("lib/python3.12/site-packages/demo.py")),
+                str(
+                    Path(
+                        "lib/python3.12/site-packages/__pycache__/demo.cpython-312.pyc"
+                    )
+                ),
             ]
         ]
         target.parent.mkdir(parents=True)
@@ -273,6 +329,7 @@ def test_hard_link_path_executor_uses_dir_fds(
     def fake_link(src, dst, *, src_dir_fd, dst_dir_fd):
         link_calls.append((src, dst, src_dir_fd, dst_dir_fd))
 
+    monkeypatch.setattr(create, "on_win", False)
     monkeypatch.setattr(create.os, "open", fake_open)
     monkeypatch.setattr(create.os, "close", lambda fd: closed.append(fd))
     monkeypatch.setattr(create.os, "link", fake_link)
@@ -290,3 +347,51 @@ def test_hard_link_path_executor_uses_dir_fds(
         ("file", "file", opened[str(source_dir)], opened[str(target_dir)])
     ]
     assert sorted(closed) == sorted(opened.values())
+
+
+def test_hard_link_path_executor_uses_windows_direct_link(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.write_text("contents")
+    link_calls = []
+
+    def direct_link(src, dst):
+        link_calls.append((src, dst))
+
+    monkeypatch.setattr(create, "on_win", True)
+    monkeypatch.setattr(create, "link", direct_link)
+    monkeypatch.setattr(
+        create,
+        "create_link",
+        lambda *args, **kwargs: pytest.fail("direct Windows link should not fall back"),
+    )
+
+    with create.HardLinkPathExecutor() as link_executor:
+        link_executor.link_or_copy(str(source), str(target))
+
+    assert link_calls == [(str(source), str(target))]
+
+
+def test_hard_link_path_executor_falls_back_after_windows_direct_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.write_text("contents")
+    fallback_calls = []
+
+    def create_link(src, dst, link_type, force=False):
+        fallback_calls.append((src, dst, link_type, force))
+
+    monkeypatch.setattr(create, "on_win", True)
+    monkeypatch.setattr(create, "link", lambda *args: raise_os_error())
+    monkeypatch.setattr(create, "create_link", create_link)
+
+    with create.HardLinkPathExecutor() as link_executor:
+        link_executor.link_or_copy(str(source), str(target))
+
+    assert fallback_calls == [
+        (str(source), str(target), create.LinkType.hardlink, False)
+    ]
