@@ -4,6 +4,7 @@ import datetime
 import json
 from os.path import abspath, basename, dirname, join
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pytest import MonkeyPatch
@@ -76,6 +77,37 @@ zlib_conda_prec = PackageRecord.from_objects(
     fn=zlib_conda_fn,
     url=f"{CONDA_PKG_REPO}/{subdir}/{zlib_conda_fn}",
 )
+
+
+def test_get_entry_to_link_prefers_target_prefix_device(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+):
+    target_prefix = tmp_path / "target"
+    target_prefix.mkdir()
+    remote_entry = SimpleNamespace(
+        is_extracted=True,
+        extracted_package_dir=str(tmp_path / "remote-cache" / "demo"),
+    )
+    local_entry = SimpleNamespace(
+        is_extracted=True,
+        extracted_package_dir=str(tmp_path / "local-cache" / "demo"),
+    )
+
+    def fake_query_all(cls, package_ref):
+        return iter((remote_entry, local_entry))
+
+    monkeypatch.setattr(PackageCacheData, "query_all", classmethod(fake_query_all))
+    monkeypatch.setattr(
+        package_cache_data,
+        "_paths_on_same_device",
+        lambda left, right: (
+            left == local_entry.extracted_package_dir and right == str(target_prefix)
+        ),
+    )
+
+    assert (
+        PackageCacheData.get_entry_to_link(object(), str(target_prefix)) is local_entry
+    )
 
 
 def test_ProgressiveFetchExtract_prefers_conda_v2_format(monkeypatch: MonkeyPatch):

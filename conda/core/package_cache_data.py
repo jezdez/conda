@@ -67,6 +67,14 @@ log = getLogger(__name__)
 
 FileNotFoundError = IOError
 
+
+def _paths_on_same_device(left, right):
+    try:
+        return os.stat(left).st_dev == os.stat(right).st_dev
+    except OSError:
+        return False
+
+
 try:
     from conda_package_handling.api import THREADSAFE_EXTRACT
 except ImportError:
@@ -258,10 +266,22 @@ class PackageCacheData(metaclass=PackageCacheType):
         )
 
     @classmethod
-    def get_entry_to_link(cls, package_ref):
-        pc_entry = next(
-            (pcrec for pcrec in cls.query_all(package_ref) if pcrec.is_extracted), None
+    def get_entry_to_link(cls, package_ref, target_prefix=None):
+        extracted_entries = tuple(
+            pcrec for pcrec in cls.query_all(package_ref) if pcrec.is_extracted
         )
+        if target_prefix is not None:
+            # Same-device cache entries preserve hardlink and APFS clone fast paths.
+            pc_entry = first(
+                extracted_entries,
+                key=lambda pcrec: _paths_on_same_device(
+                    pcrec.extracted_package_dir, target_prefix
+                ),
+            )
+            if pc_entry is not None:
+                return pc_entry
+
+        pc_entry = next(iter(extracted_entries), None)
         if pc_entry is not None:
             return pc_entry
 
