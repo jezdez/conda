@@ -35,6 +35,7 @@ from conda.core.path_actions import (
     CreatePythonEntryPointAction,
     LinkPathAction,
     PrefixReplaceLinkAction,
+    _path_parts,
 )
 from conda.gateways.disk.create import create_link, mkdir_p
 from conda.gateways.disk.delete import rm_rf
@@ -527,6 +528,16 @@ def test_BulkHardLinkPathAction_hardlink(prefix: Path, pkgs_dir: Path):
 
     bulk.reverse()
     assert all(not lexists(action.target_full_path) for action in actions)
+
+
+def test_path_parts_splits_manifest_paths_not_host_paths():
+    assert _path_parts(r"lib\python/site-packages\demo.py") == (
+        "lib",
+        "python",
+        "site-packages",
+        "demo.py",
+    )
+    assert _path_parts("//lib//demo/") == ("lib", "demo")
 
 
 def test_BulkClonePathAction_clones_manifest_directory(
