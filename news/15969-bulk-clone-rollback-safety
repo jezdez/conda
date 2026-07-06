@@ -1,0 +1,3 @@
+### Bug fixes
+
+* Clean up partially cloned package directories when bulk clone post-processing fails during install transactions. (#15969)

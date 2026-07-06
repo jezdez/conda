@@ -667,7 +667,13 @@ class BulkClonePathAction(MultiPathAction):
 
             mkdir_p(dirname(target_dir))
             if clone_directory(source_dir, target_dir):
-                self._touch_cloned_python_import_dirs(directory_parts, target_dir)
+                try:
+                    self._touch_cloned_python_import_dirs(directory_parts, target_dir)
+                except Exception:
+                    # Keep rollback state honest: until post-clone fixups finish,
+                    # the covered LinkPathActions have not been marked successful.
+                    rm_rf(target_dir)
+                    raise
                 for action in clone_actions:
                     action._execute_successful = True
                 covered_actions.update(clone_actions)
@@ -683,7 +689,7 @@ class BulkClonePathAction(MultiPathAction):
             if action not in covered_actions
         )
         # Leftover clone actions are the fallback tail after directory clones.
-        # On non-APFS platforms determine_link_type never selects LinkType.clone.
+        # Platforms without directory clone support execute these file-by-file.
         workers = (
             1
             if context.debug or len(remaining_actions) < PARALLEL_PATH_ACTION_THRESHOLD
@@ -702,6 +708,9 @@ class BulkClonePathAction(MultiPathAction):
                     executor.submit(action.execute) for action in remaining_actions
                 )
                 for future in futures:
+                    # ThreadPoolExecutor waits for submitted work during context
+                    # exit; each completed LinkPathAction marks its own rollback
+                    # state, so transaction reverse can clean partial success.
                     future.result()
         self._execute_successful = True
 

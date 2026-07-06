@@ -650,6 +650,123 @@ def test_BulkClonePathAction_touches_cloned_site_packages(
     assert touched == [str(prefix / site_packages)]
 
 
+def test_BulkClonePathAction_removes_clone_when_touch_fails(
+    monkeypatch: pytest.MonkeyPatch, prefix: Path, pkgs_dir: Path
+):
+    package_dir = pkgs_dir / "package"
+    site_packages = "lib/python3.12/site-packages"
+    source_dir = package_dir / site_packages / "demo"
+    source_dir.mkdir(parents=True)
+    source_path = source_dir / "__init__.py"
+    source_path.write_text("contents")
+    source_short_path = f"{site_packages}/demo/__init__.py"
+    source_path_data = PathDataV1(
+        _path=source_short_path,
+        path_type=PathEnum.hardlink,
+        sha256=compute_sum(source_path, "sha256"),
+        size_in_bytes=getsize(source_path),
+    )
+    transaction_context = {"target_site_packages_short_path": site_packages}
+    directory_action = LinkPathAction(
+        transaction_context,
+        AttrDict(extracted_package_dir=str(package_dir)),
+        None,
+        None,
+        prefix,
+        f"{site_packages}/demo",
+        LinkType.directory,
+        None,
+    )
+    file_action = LinkPathAction(
+        transaction_context,
+        AttrDict(extracted_package_dir=str(package_dir)),
+        str(package_dir),
+        source_short_path,
+        prefix,
+        source_short_path,
+        LinkType.clone,
+        source_path_data,
+    )
+
+    def fake_clone_directory(src, dst):
+        copytree(src, dst)
+        return True
+
+    monkeypatch.setattr("conda.core.path_actions.clone_directory", fake_clone_directory)
+    monkeypatch.setattr(
+        "conda.core.path_actions.touch",
+        lambda path: (_ for _ in ()).throw(OSError("touch failed")),
+    )
+
+    bulk = BulkClonePathAction((directory_action,), (file_action,))
+    bulk.verify()
+
+    with pytest.raises(OSError, match="touch failed"):
+        bulk.execute()
+
+    assert not lexists(prefix / "lib")
+    assert not file_action._execute_successful
+
+
+def test_BulkClonePathAction_partial_file_failure_reverses_success(
+    monkeypatch: pytest.MonkeyPatch, prefix: Path, pkgs_dir: Path
+):
+    package_dir = pkgs_dir / "package"
+    source_dir = package_dir / "lib" / "demo"
+    source_dir.mkdir(parents=True)
+    source_paths = (source_dir / "one.py", source_dir / "two.py")
+    for source_path in source_paths:
+        source_path.write_text("contents")
+
+    file_actions = []
+    for source_path in source_paths:
+        source_short_path = f"lib/demo/{source_path.name}"
+        source_path_data = PathDataV1(
+            _path=source_short_path,
+            path_type=PathEnum.hardlink,
+            sha256=compute_sum(source_path, "sha256"),
+            size_in_bytes=getsize(source_path),
+        )
+        file_actions.append(
+            LinkPathAction(
+                {},
+                AttrDict(extracted_package_dir=str(package_dir)),
+                str(package_dir),
+                source_short_path,
+                prefix,
+                source_short_path,
+                LinkType.clone,
+                source_path_data,
+            )
+        )
+
+    def fake_create_link(src, dst, link_type, force=False):
+        if dst.endswith("one.py"):
+            mkdir_p(dirname(dst))
+            with open(dst, "w") as fh:
+                fh.write("linked")
+            return
+        raise OSError("link failed")
+
+    monkeypatch.setattr("conda.core.path_actions.clone_directory", lambda *args: False)
+    monkeypatch.setattr("conda.core.path_actions.create_link", fake_create_link)
+    monkeypatch.setattr("conda.core.path_actions.PARALLEL_PATH_ACTION_THRESHOLD", 1)
+    monkeypatch.setattr("conda.core.path_actions.PARALLEL_PATH_ACTION_WORKERS", 2)
+
+    bulk = BulkClonePathAction((), tuple(file_actions))
+    bulk.verify()
+
+    with pytest.raises(OSError, match="link failed"):
+        bulk.execute()
+
+    assert file_actions[0]._execute_successful
+    assert not file_actions[1]._execute_successful
+
+    bulk.reverse()
+
+    assert not lexists(file_actions[0].target_full_path)
+
+
 def test_PrefixReplaceLinkAction_lazy_verify_signs_immediately(
     monkeypatch: pytest.MonkeyPatch, prefix: Path, tmp_path: Path
 ):
