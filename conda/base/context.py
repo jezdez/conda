@@ -277,6 +277,9 @@ class Context(Configuration):
     _execute_threads = ParameterLoader(
         PrimitiveParameter(0, element_type=int), aliases=("execute_threads",)
     )
+    _pyc_compile_threads = ParameterLoader(
+        PrimitiveParameter(0, element_type=int), aliases=("pyc_compile_threads",)
+    )
 
     # Safety & Security
     _aggressive_update_packages = ParameterLoader(
@@ -714,6 +717,10 @@ class Context(Configuration):
         else:
             threads = 1
         return threads
+
+    @property
+    def pyc_compile_threads(self) -> int | None:
+        return self._pyc_compile_threads or self.default_threads or 0
 
     @property
     def subdir(self) -> str:  # TODO: Make KNOWN_SUBDIRS an Enum
@@ -1359,6 +1366,7 @@ class Context(Configuration):
             "separate_format_cache",
             "verify_threads",
             "execute_threads",
+            "pyc_compile_threads",
         ),
         "Conda-build Configuration": (
             "bld_path",
@@ -1651,6 +1659,7 @@ class Context(Configuration):
                     * repodata_threads - for fetching/loading repodata
                     * verify_threads - for verifying package contents in transactions
                     * execute_threads - for carrying out the unlinking and linking steps
+                    * pyc_compile_threads - for compiling Python bytecode during installs
                 """
             ),
             disallowed_packages=dals(
@@ -1696,6 +1705,13 @@ class Context(Configuration):
                 Threads to use when performing the unlink/link transaction.  When not set,
                 defaults to 1.  This step is pretty strongly I/O limited, and you may not
                 see much benefit here.
+                """
+            ),
+            pyc_compile_threads=dals(
+                """
+                Threads to use when compiling Python bytecode files during installation.
+                When set to 0, conda chooses a small worker count based on the number of
+                bytecode files and CPUs.
                 """
             ),
             export_platforms=dals(
