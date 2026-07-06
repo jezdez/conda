@@ -505,6 +505,9 @@ class HardLinkPathExecutor:
         self._use_dir_fds = not on_win and os.link in os.supports_dir_fd and not force
         # Windows lacks dir_fd support here, but can still skip create_link overhead.
         self._use_windows_direct = on_win and not force
+        # If direct CreateHardLink-style linking fails once, stop using the
+        # shortcut but keep conda's normal per-file hardlink-then-copy fallback.
+        self._windows_direct_failed = False
 
     def __enter__(self):
         return self
@@ -528,12 +531,19 @@ class HardLinkPathExecutor:
 
     def link_or_copy(self, src, dst):
         if self._use_windows_direct and not isdir(src):
-            try:
-                log.log(TRACE, "hard linking %s => %s", src, dst)
-                link(src, dst)
-                return
-            except OSError as e:
-                log.debug("%r", e)
+            if not self._windows_direct_failed:
+                try:
+                    log.log(TRACE, "hard linking %s => %s", src, dst)
+                    link(src, dst)
+                    return
+                except OSError as e:
+                    log.debug("%r", e)
+                    self._windows_direct_failed = True
+            # A direct Windows failure is not enough evidence to copy the rest
+            # of a package. The normal path still tries hardlink for each file
+            # and only falls back to copy for files that actually need it.
+            create_link(src, dst, LinkType.hardlink, force=self._force)
+            return
 
         if self._use_dir_fds and not isdir(src):
             try:

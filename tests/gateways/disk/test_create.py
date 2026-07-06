@@ -393,20 +393,31 @@ def test_hard_link_path_executor_falls_back_after_windows_direct_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
     source = tmp_path / "source"
+    source_two = tmp_path / "source-two"
     target = tmp_path / "target"
+    target_two = tmp_path / "target-two"
     source.write_text("contents")
+    source_two.write_text("contents")
+    link_calls = []
     fallback_calls = []
+
+    def direct_link(src, dst):
+        link_calls.append((src, dst))
+        raise_os_error()
 
     def create_link(src, dst, link_type, force=False):
         fallback_calls.append((src, dst, link_type, force))
 
     monkeypatch.setattr(create, "on_win", True)
-    monkeypatch.setattr(create, "link", lambda *args: raise_os_error())
+    monkeypatch.setattr(create, "link", direct_link)
     monkeypatch.setattr(create, "create_link", create_link)
 
     with create.HardLinkPathExecutor() as link_executor:
         link_executor.link_or_copy(str(source), str(target))
+        link_executor.link_or_copy(str(source_two), str(target_two))
 
+    assert link_calls == [(str(source), str(target))]
     assert fallback_calls == [
-        (str(source), str(target), create.LinkType.hardlink, False)
+        (str(source), str(target), create.LinkType.hardlink, False),
+        (str(source_two), str(target_two), create.LinkType.hardlink, False),
     ]

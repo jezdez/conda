@@ -1,0 +1,3 @@
+### Enhancements
+
+* Keep using conda's per-file hardlink fallback after a direct Windows hardlink shortcut fails during package installs. (#15969)
