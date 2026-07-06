@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 from contextlib import nullcontext
 from pathlib import Path
 from shutil import copyfile
@@ -59,6 +60,7 @@ def test_copy_uses_clonefile_on_macos(monkeypatch: pytest.MonkeyPatch, tmp_path)
         lambda src, dst: pytest.fail("copy fallback should not be used"),
     )
     create._CLONEFILE_UNSUPPORTED_DEVICES.clear()
+    create._CLONEFILE_SUPPORTED_DEVICES.clear()
     monkeypatch.setattr(create, "_CLONEFILE", None)
 
     create.copy(str(source), str(target))
@@ -97,6 +99,7 @@ def test_copy_caches_unsupported_clonefile_device_pair(
     monkeypatch.setattr(create, "get_errno", lambda: errno.ENOTSUP)
     monkeypatch.setattr(create, "_do_copy", copy_fallback)
     create._CLONEFILE_UNSUPPORTED_DEVICES.clear()
+    create._CLONEFILE_SUPPORTED_DEVICES.clear()
     monkeypatch.setattr(create, "_CLONEFILE", None)
 
     create.copy(str(source), str(target_one))
@@ -109,6 +112,94 @@ def test_copy_caches_unsupported_clonefile_device_pair(
         (str(source), str(target_one)),
         (str(source), str(target_two)),
     ]
+
+
+def test_copy_uses_linux_reflink(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.write_text("contents")
+    reflink_calls = []
+
+    def reflink(dst_fd, request, src_fd):
+        reflink_calls.append((dst_fd, request, src_fd))
+        os.lseek(src_fd, 0, os.SEEK_SET)
+        os.write(dst_fd, os.read(src_fd, source.stat().st_size))
+
+    monkeypatch.setattr(create.sys, "platform", "linux")
+    monkeypatch.setattr(create, "_FICLONE_IOCTL", reflink)
+    monkeypatch.setattr(
+        create,
+        "_do_copy",
+        lambda src, dst: pytest.fail("copy fallback should not be used"),
+    )
+    create._FICLONE_UNSUPPORTED_DEVICES.clear()
+    create._FICLONE_SUPPORTED_DEVICES.clear()
+
+    create.copy(str(source), str(target))
+
+    assert target.read_text() == "contents"
+    assert len(reflink_calls) == 1
+    assert reflink_calls[0][1] == create._FICLONE
+
+
+def test_copy_caches_unsupported_linux_reflink_device_pair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    source = tmp_path / "source"
+    target_one = tmp_path / "target-one"
+    target_two = tmp_path / "target-two"
+    source.write_text("contents")
+    reflink_calls = []
+    copy_calls = []
+
+    def reflink(dst_fd, request, src_fd):
+        reflink_calls.append((dst_fd, request, src_fd))
+        os.write(dst_fd, b"partial")
+        raise OSError(getattr(errno, "EOPNOTSUPP", errno.EINVAL), "unsupported")
+
+    def copy_fallback(src, dst):
+        copy_calls.append((src, dst, Path(dst).exists()))
+        copyfile(src, dst)
+
+    monkeypatch.setattr(create.sys, "platform", "linux")
+    monkeypatch.setattr(create, "_FICLONE_IOCTL", reflink)
+    monkeypatch.setattr(create, "_do_copy", copy_fallback)
+    create._FICLONE_UNSUPPORTED_DEVICES.clear()
+    create._FICLONE_SUPPORTED_DEVICES.clear()
+
+    create.copy(str(source), str(target_one))
+    create.copy(str(source), str(target_two))
+
+    assert target_one.read_text() == "contents"
+    assert target_two.read_text() == "contents"
+    assert len(reflink_calls) == 1
+    assert copy_calls == [
+        (str(source), str(target_one), False),
+        (str(source), str(target_two), False),
+    ]
+
+
+def test_clone_file_supported_reuses_supported_device_pair(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    source = tmp_path / "source"
+    dest_dir = tmp_path / "dest"
+    source.write_text("contents")
+    dest_dir.mkdir()
+    device_pair = (source.stat().st_dev, dest_dir.stat().st_dev)
+
+    monkeypatch.setattr(create.sys, "platform", "linux")
+    monkeypatch.setattr(
+        create,
+        "_clone_file",
+        lambda *args: pytest.fail("known-supported device pair should not probe"),
+    )
+    create.clone_file_supported.cache_clear()
+    create._FICLONE_UNSUPPORTED_DEVICES.clear()
+    create._FICLONE_SUPPORTED_DEVICES.clear()
+    create._FICLONE_SUPPORTED_DEVICES.add(device_pair)
+
+    assert create.clone_file_supported(str(source), str(dest_dir)) is True
 
 
 def test_do_copy_uses_windows_copyfile(monkeypatch: pytest.MonkeyPatch, tmp_path):
@@ -245,6 +336,10 @@ def test_clone_file_supported_probes_and_cleans_up(
     monkeypatch.setattr(create, "_clone_file", fake_clone)
     monkeypatch.setattr(create, "rm_rf", lambda path: removed.append(path))
     create.clone_file_supported.cache_clear()
+    create._CLONEFILE_UNSUPPORTED_DEVICES.clear()
+    create._CLONEFILE_SUPPORTED_DEVICES.clear()
+    create._FICLONE_UNSUPPORTED_DEVICES.clear()
+    create._FICLONE_SUPPORTED_DEVICES.clear()
 
     assert create.clone_file_supported(str(source), str(dest_dir)) is True
     assert len(clone_calls) == 1

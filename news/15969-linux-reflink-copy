@@ -1,0 +1,3 @@
+### Enhancements
+
+* Use Linux FICLONE reflinks as a copy-on-write fallback for package file copies when the filesystem supports them. (#15969)

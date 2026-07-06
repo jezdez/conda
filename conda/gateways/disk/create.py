@@ -9,11 +9,12 @@ import tempfile
 import warnings as _warnings
 from collections import OrderedDict
 from ctypes import CDLL, c_char_p, c_int, get_errno
-from errno import EACCES, ENOSYS, EPERM, EROFS, EXDEV
+from errno import EACCES, EINVAL, ENOSYS, EPERM, EROFS, EXDEV
 from functools import cache
 from logging import getLogger
 from os.path import basename, dirname, isdir, isfile, join, splitext
 from shutil import copyfileobj, copystat
+from threading import Lock
 from uuid import uuid4
 
 from ... import CondaError
@@ -96,19 +97,28 @@ deprecated.constant(
     addendum="Use `conda.gateways.streams.stdoutlog` instead.",
 )
 
-_CLONEFILE_UNSUPPORTED_ERRNOS = frozenset(
+_CLONE_UNSUPPORTED_ERRNOS = frozenset(
     error
     for error in (
         EXDEV,
+        EINVAL,
         ENOSYS,
+        getattr(errno, "ENOTTY", None),
         getattr(errno, "ENOTSUP", None),
         getattr(errno, "EOPNOTSUPP", None),
     )
     if error is not None
 )
 _CLONEFILE_UNSUPPORTED_DEVICES: set[tuple[int, int]] = set()
+_CLONEFILE_SUPPORTED_DEVICES: set[tuple[int, int]] = set()
 _CLONEFILE_UNAVAILABLE = object()
 _CLONEFILE = None
+_FICLONE = 0x40049409
+_FICLONE_UNSUPPORTED_DEVICES: set[tuple[int, int]] = set()
+_FICLONE_SUPPORTED_DEVICES: set[tuple[int, int]] = set()
+_FICLONE_UNAVAILABLE = object()
+_FICLONE_IOCTL = None
+_CLONE_CACHE_LOCK = Lock()
 _WIN_COPYFILE_UNAVAILABLE = object()
 _WIN_COPYFILE = None
 
@@ -343,8 +353,8 @@ def copy(src, dst):
             log.log(TRACE, "soft linking %s => %s", src, dst)
             symlink(src_points_to, dst)
             return
-    # APFS clonefile gives copy-on-write semantics for normal copy requests.
-    # Unsupported filesystems fall through to the byte-copy path below.
+    # APFS clonefile and Linux FICLONE give copy-on-write semantics for normal
+    # copy requests. Unsupported filesystems fall through to byte-copy below.
     if _clone_file(src, dst):
         try:
             copystat(src, dst)
@@ -391,6 +401,24 @@ def clone_file_supported(source_file, dest_dir):
         raise OSError(f"Path {source_file} is not a file")
     if not isdir(dest_dir):
         raise OSError(f"Path {dest_dir} is not a directory")
+    try:
+        device_pair = (os.stat(source_file).st_dev, os.stat(dest_dir).st_dev)
+    except OSError:
+        device_pair = None
+    if device_pair is not None:
+        # determine_link_type asks this once per package; the filesystem answer
+        # is device-pair scoped, so reuse prior success/failure probes.
+        with _CLONE_CACHE_LOCK:
+            if sys.platform == "darwin":
+                if device_pair in _CLONEFILE_SUPPORTED_DEVICES:
+                    return True
+                if device_pair in _CLONEFILE_UNSUPPORTED_DEVICES:
+                    return False
+            elif sys.platform.startswith("linux"):
+                if device_pair in _FICLONE_SUPPORTED_DEVICES:
+                    return True
+                if device_pair in _FICLONE_UNSUPPORTED_DEVICES:
+                    return False
     if lexists(test_file):
         rm_rf(test_file)
     if lexists(test_file):
@@ -402,7 +430,60 @@ def clone_file_supported(source_file, dest_dir):
 
 
 def _clone_file(src, dst):
-    if sys.platform != "darwin" or islink(src):
+    if islink(src):
+        return False
+    if sys.platform == "darwin":
+        return _clone_file_macos(src, dst)
+    if sys.platform.startswith("linux"):
+        return _clone_file_linux(src, dst)
+    return False
+
+
+def _clone_file_macos(src, dst):
+    try:
+        src_dev = os.stat(src).st_dev
+        dst_dev = os.stat(dirname(dst) or ".").st_dev
+    except OSError:
+        return False
+    device_pair = (src_dev, dst_dev)
+
+    global _CLONEFILE
+    # Resolve clonefile lazily so importing conda stays portable and cheap.
+    with _CLONE_CACHE_LOCK:
+        if device_pair in _CLONEFILE_UNSUPPORTED_DEVICES:
+            return False
+        if _CLONEFILE is _CLONEFILE_UNAVAILABLE:
+            return False
+        if _CLONEFILE is None:
+            try:
+                clonefile = CDLL(None, use_errno=True).clonefile
+            except AttributeError:
+                _CLONEFILE = _CLONEFILE_UNAVAILABLE
+                return False
+            clonefile.argtypes = (c_char_p, c_char_p, c_int)
+            clonefile.restype = c_int
+            _CLONEFILE = clonefile
+        clonefile = _CLONEFILE
+
+    if clonefile(os.fsencode(src), os.fsencode(dst), 0) == 0:
+        log.log(TRACE, "cloning %s => %s", src, dst)
+        with _CLONE_CACHE_LOCK:
+            _CLONEFILE_SUPPORTED_DEVICES.add(device_pair)
+        return True
+    errno = get_errno()
+    log.debug("clonefile failed with errno %s for %s => %s", errno, src, dst)
+    if errno in _CLONE_UNSUPPORTED_ERRNOS:
+        # Cross-device and unsupported filesystem failures are stable for this
+        # source/destination pair; skip repeated clonefile probes.
+        with _CLONE_CACHE_LOCK:
+            _CLONEFILE_UNSUPPORTED_DEVICES.add(device_pair)
+    if lexists(dst):
+        rm_rf(dst)
+    return False
+
+
+def _clone_file_linux(src, dst):
+    if not isfile(src):
         return False
     try:
         src_dev = os.stat(src).st_dev
@@ -410,35 +491,42 @@ def _clone_file(src, dst):
     except OSError:
         return False
     device_pair = (src_dev, dst_dev)
-    if device_pair in _CLONEFILE_UNSUPPORTED_DEVICES:
-        return False
 
-    global _CLONEFILE
-    # Resolve clonefile lazily so importing conda stays portable and cheap.
-    if _CLONEFILE is _CLONEFILE_UNAVAILABLE:
-        return False
-    if _CLONEFILE is None:
-        try:
-            clonefile = CDLL(None, use_errno=True).clonefile
-        except AttributeError:
-            _CLONEFILE = _CLONEFILE_UNAVAILABLE
+    global _FICLONE_IOCTL
+    # Import lazily because fcntl is Unix-only and conda imports this module on
+    # Windows too. The ioctl itself is cheap once the callable is cached.
+    with _CLONE_CACHE_LOCK:
+        if device_pair in _FICLONE_UNSUPPORTED_DEVICES:
             return False
-        clonefile.argtypes = (c_char_p, c_char_p, c_int)
-        clonefile.restype = c_int
-        _CLONEFILE = clonefile
+        if _FICLONE_IOCTL is _FICLONE_UNAVAILABLE:
+            return False
+        if _FICLONE_IOCTL is None:
+            try:
+                from fcntl import ioctl
+            except ImportError:
+                _FICLONE_IOCTL = _FICLONE_UNAVAILABLE
+                return False
+            _FICLONE_IOCTL = ioctl
+        ficlone_ioctl = _FICLONE_IOCTL
 
-    if _CLONEFILE(os.fsencode(src), os.fsencode(dst), 0) == 0:
-        log.log(TRACE, "cloning %s => %s", src, dst)
+    try:
+        with open(src, "rb") as fsrc:
+            with open(dst, "xb") as fdst:
+                ficlone_ioctl(fdst.fileno(), _FICLONE, fsrc.fileno())
+        log.log(TRACE, "reflinking %s => %s", src, dst)
+        with _CLONE_CACHE_LOCK:
+            _FICLONE_SUPPORTED_DEVICES.add(device_pair)
         return True
-    errno = get_errno()
-    log.debug("clonefile failed with errno %s for %s => %s", errno, src, dst)
-    if errno in _CLONEFILE_UNSUPPORTED_ERRNOS:
-        # Cross-device and unsupported filesystem failures are stable for this
-        # source/destination pair; skip repeated clonefile probes.
-        _CLONEFILE_UNSUPPORTED_DEVICES.add(device_pair)
-    if lexists(dst):
-        rm_rf(dst)
-    return False
+    except OSError as e:
+        log.debug("FICLONE failed with errno %s for %s => %s", e.errno, src, dst)
+        if e.errno in _CLONE_UNSUPPORTED_ERRNOS:
+            # Filesystem support is stable for a package-cache/prefix device
+            # pair, so avoid an ioctl failure for every file in the package.
+            with _CLONE_CACHE_LOCK:
+                _FICLONE_UNSUPPORTED_DEVICES.add(device_pair)
+        if lexists(dst):
+            rm_rf(dst)
+        return False
 
 
 def _do_copy(src, dst):
