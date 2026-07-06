@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import stat
 from contextlib import nullcontext
 from pathlib import Path
 from shutil import copyfile
@@ -67,6 +68,38 @@ def test_copy_uses_clonefile_on_macos(monkeypatch: pytest.MonkeyPatch, tmp_path)
 
     assert target.read_text() == "contents"
     assert clone_calls == [(bytes(source), bytes(target), 0)]
+
+
+def test_copy_clone_preserves_source_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.write_text("contents")
+    source.chmod(0o744)
+    os.utime(source, (1_700_000_000, 1_700_000_000))
+
+    class CloneFile:
+        argtypes = None
+        restype = None
+
+        def __call__(self, src, dst, flags):
+            copyfile(src, dst)
+            return 0
+
+    class LibC:
+        clonefile = CloneFile()
+
+    monkeypatch.setattr(create.sys, "platform", "darwin")
+    monkeypatch.setattr(create, "CDLL", lambda *args, **kwargs: LibC())
+    create._CLONEFILE_UNSUPPORTED_DEVICES.clear()
+    create._CLONEFILE_SUPPORTED_DEVICES.clear()
+    monkeypatch.setattr(create, "_CLONEFILE", None)
+
+    create.copy(str(source), str(target))
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o744
+    assert int(target.stat().st_mtime) == 1_700_000_000
 
 
 def test_copy_caches_unsupported_clonefile_device_pair(
