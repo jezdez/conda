@@ -110,6 +110,26 @@ def test_get_entry_to_link_prefers_target_prefix_device(
     )
 
 
+def test_paths_on_same_device_caches_stat(monkeypatch: MonkeyPatch, tmp_path: Path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    stat_calls = []
+    real_stat = package_cache_data.os.stat
+
+    def stat(path):
+        stat_calls.append(path)
+        return real_stat(path)
+
+    package_cache_data._paths_on_same_device.cache_clear()
+    monkeypatch.setattr(package_cache_data.os, "stat", stat)
+
+    assert package_cache_data._paths_on_same_device(str(left), str(right)) is True
+    assert package_cache_data._paths_on_same_device(str(left), str(right)) is True
+    assert stat_calls == [str(left), str(right)]
+
+
 def test_ProgressiveFetchExtract_prefers_conda_v2_format(monkeypatch: MonkeyPatch):
     # force this to False, because otherwise tests fail when run with old conda-build
     # zlib is available in local "linux-64" subdir

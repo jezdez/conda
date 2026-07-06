@@ -8,7 +8,7 @@ import os
 from collections import defaultdict
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from errno import EACCES, ENOENT, EPERM, EROFS
-from functools import partial
+from functools import cache, partial
 from itertools import chain
 from logging import getLogger
 from os import scandir
@@ -68,7 +68,11 @@ log = getLogger(__name__)
 FileNotFoundError = IOError
 
 
+@cache
 def _paths_on_same_device(left, right):
+    # Device ids are stable for the package-cache and prefix directories during
+    # a transaction. Caching avoids repeated stat calls when several matching
+    # cache entries are considered for many package records.
     try:
         return os.stat(left).st_dev == os.stat(right).st_dev
     except OSError:
