@@ -89,6 +89,30 @@ def test_aggregate_link_actions_keeps_link_path_subclasses_individual():
     assert actions == (plain_one, special, plain_two)
 
 
+def test_aggregate_link_actions_keeps_clone_and_hardlink_batches_separate():
+    def plain_action(link_type, target_short_path):
+        action = object.__new__(link.LinkPathAction)
+        action.link_type = link_type
+        action.target_short_path = target_short_path
+        action.source_short_path = target_short_path
+        action.transaction_context = {}
+        action.package_info = SimpleNamespace()
+        action.target_prefix = "/prefix"
+        return action
+
+    directory = plain_action(LinkType.directory, "lib/demo")
+    clone_action = plain_action(LinkType.clone, "lib/demo/module.py")
+    hardlink_one = plain_action(LinkType.hardlink, "bin/one")
+    hardlink_two = plain_action(LinkType.hardlink, "bin/two")
+
+    actions = link.UnlinkLinkTransaction._aggregate_link_actions(
+        (directory, clone_action, hardlink_one, hardlink_two)
+    )
+
+    assert isinstance(actions[0], link.BulkClonePathAction)
+    assert isinstance(actions[1], link.BulkHardLinkPathAction)
+
+
 @pytest.mark.parametrize(
     "paths,files,expected",
     (

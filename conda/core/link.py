@@ -1316,6 +1316,9 @@ class UnlinkLinkTransaction:
                 *remaining_actions,
             )
 
+        # Bulk clone and bulk hardlink intentionally stay as separate passes:
+        # clone aggregation consumes directory actions for one package subtree,
+        # while hardlink aggregation only batches adjacent plain file links.
         bulkable_actions = []
         aggregate_actions = []
         for action in actions:
