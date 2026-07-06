@@ -100,12 +100,17 @@ def determine_link_type(extracted_package_dir, target_prefix):
         return LinkType.copy
     if context.always_softlink:
         return LinkType.softlink
-    # Clone comes before hardlink so APFS can clone whole eligible directories;
-    # CreatePrefixRecordAction normalizes this internal mode back to copy.
-    if clone_file_supported(source_test_file, target_prefix):
+    # APFS can clone whole eligible directories, which is faster than issuing
+    # one hardlink syscall per file. Linux reflinks are file-oriented here, so
+    # keep conda's cheap hardlink path first on non-macOS platforms.
+    if sys.platform == "darwin" and clone_file_supported(
+        source_test_file, target_prefix
+    ):
         return LinkType.clone
     if hardlink_supported(source_test_file, target_prefix):
         return LinkType.hardlink
+    if clone_file_supported(source_test_file, target_prefix):
+        return LinkType.clone
     if context.allow_softlinks and softlink_supported(source_test_file, target_prefix):
         return LinkType.softlink
     return LinkType.copy

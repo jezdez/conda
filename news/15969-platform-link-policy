@@ -1,0 +1,3 @@
+### Enhancements
+
+* Keep hardlink-first package installs on non-macOS platforms while preserving APFS clone-first installs on macOS. (#15969)

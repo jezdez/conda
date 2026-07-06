@@ -31,7 +31,7 @@ def test_verify_pre_link_message_skips_missing_message_dir(
     transaction._verify_pre_link_message([LinkGroup()])
 
 
-def test_determine_link_type_prefers_clone_link_mode(
+def test_determine_link_type_prefers_clone_link_mode_on_macos(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     package_dir = tmp_path / "package"
@@ -40,12 +40,50 @@ def test_determine_link_type_prefers_clone_link_mode(
     target_prefix.mkdir()
     (package_dir / "info" / "index.json").write_text("{}")
 
+    monkeypatch.setattr(link.sys, "platform", "darwin")
     monkeypatch.setattr(link, "clone_file_supported", lambda *args: True)
     monkeypatch.setattr(
         link,
         "hardlink_supported",
         lambda *args: pytest.fail("clone-backed copy should be preferred"),
     )
+
+    assert (
+        link.determine_link_type(str(package_dir), str(target_prefix)) == LinkType.clone
+    )
+
+
+def test_determine_link_type_prefers_hardlink_before_clone_off_macos(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    package_dir = tmp_path / "package"
+    target_prefix = tmp_path / "prefix"
+    (package_dir / "info").mkdir(parents=True)
+    target_prefix.mkdir()
+    (package_dir / "info" / "index.json").write_text("{}")
+
+    monkeypatch.setattr(link.sys, "platform", "linux")
+    monkeypatch.setattr(link, "clone_file_supported", lambda *args: True)
+    monkeypatch.setattr(link, "hardlink_supported", lambda *args: True)
+
+    assert (
+        link.determine_link_type(str(package_dir), str(target_prefix))
+        == LinkType.hardlink
+    )
+
+
+def test_determine_link_type_uses_clone_off_macos_when_hardlink_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    package_dir = tmp_path / "package"
+    target_prefix = tmp_path / "prefix"
+    (package_dir / "info").mkdir(parents=True)
+    target_prefix.mkdir()
+    (package_dir / "info" / "index.json").write_text("{}")
+
+    monkeypatch.setattr(link.sys, "platform", "linux")
+    monkeypatch.setattr(link, "hardlink_supported", lambda *args: False)
+    monkeypatch.setattr(link, "clone_file_supported", lambda *args: True)
 
     assert (
         link.determine_link_type(str(package_dir), str(target_prefix)) == LinkType.clone
@@ -61,6 +99,7 @@ def test_determine_link_type_falls_back_to_hardlink_without_clone(
     target_prefix.mkdir()
     (package_dir / "info" / "index.json").write_text("{}")
 
+    monkeypatch.setattr(link.sys, "platform", "darwin")
     monkeypatch.setattr(link, "clone_file_supported", lambda *args: False)
     monkeypatch.setattr(link, "hardlink_supported", lambda *args: True)
 
