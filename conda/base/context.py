@@ -455,6 +455,7 @@ class Context(Configuration):
         aliases=("error_upload_url",),
     )
     force = ParameterLoader(PrimitiveParameter(False))
+    compile_pyc = ParameterLoader(PrimitiveParameter(True))
     json = ParameterLoader(PrimitiveParameter(False))
     _console = ParameterLoader(
         PrimitiveParameter(DEFAULT_CONSOLE_REPORTER_BACKEND, element_type=str),
@@ -1348,6 +1349,7 @@ class Context(Configuration):
             "allow_softlinks",
             "always_copy",
             "always_softlink",
+            "compile_pyc",
             "path_conflict",
             "rollback_enabled",
             "safety_checks",
@@ -1696,6 +1698,13 @@ class Context(Configuration):
                 Threads to use when performing the unlink/link transaction.  When not set,
                 defaults to 1.  This step is pretty strongly I/O limited, and you may not
                 see much benefit here.
+                """
+            ),
+            compile_pyc=dals(
+                """
+                Compile Python bytecode files for noarch Python packages during installation.
+                Disable this when startup-time bytecode compilation is preferable to
+                install-time compilation.
                 """
             ),
             export_platforms=dals(
