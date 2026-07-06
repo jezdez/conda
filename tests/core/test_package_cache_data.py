@@ -676,6 +676,35 @@ def test_cover_reverse():
     package_cache_data.do_extract_action("dummy", None, None)
 
 
+def test_do_extract_action_uses_windows_retry(monkeypatch: MonkeyPatch):
+    calls = []
+    extract_action = SimpleNamespace(
+        verify=lambda: calls.append("verify"),
+        execute=lambda progress_callback: calls.append(("execute", progress_callback)),
+    )
+    progress_bar = SimpleNamespace(
+        update_to=lambda progress: calls.append(("progress", progress))
+    )
+
+    def backoff(fn, *args, **kwargs):
+        calls.append(("backoff", args, kwargs))
+        return fn(*args)
+
+    monkeypatch.setattr(package_cache_data, "platform", "win32")
+    monkeypatch.setattr(package_cache_data, "exp_backoff_fn", backoff)
+
+    assert (
+        package_cache_data.do_extract_action("dummy", extract_action, progress_bar)
+        == "dummy"
+    )
+    assert calls == [
+        "verify",
+        ("backoff", (None,), {"max_tries": 9}),
+        ("execute", None),
+        ("progress", 1.0),
+    ]
+
+
 def test_cover_get_entry_to_link(tmp_pkgs_dir: Path):
     with pytest.raises(CondaError):
         PackageCacheData.get_entry_to_link(

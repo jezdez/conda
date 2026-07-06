@@ -36,6 +36,7 @@ from ..common.signals import signal_handler
 from ..common.terminal import is_tty, term_dumb
 from ..common.url import path_to_url
 from ..exceptions import NotWritableError, NoWritablePkgsDirError
+from ..gateways.disk import exp_backoff_fn
 from ..gateways.disk.create import (
     create_package_cache_directory,
     write_as_json_to_file,
@@ -1020,7 +1021,12 @@ def do_extract_action(prec, extract_action, progress_bar):
     extract_action.verify()
     # currently unable to do updates on extract;
     # likely too fast to bother
-    extract_action.execute(None)
+    if platform == "win32":
+        # Antivirus and search indexers can briefly hold handles while the
+        # extractor writes the package cache. Give Windows a longer retry window.
+        exp_backoff_fn(extract_action.execute, None, max_tries=9)
+    else:
+        extract_action.execute(None)
     progress_bar.update_to(1.0)
     return prec
 
