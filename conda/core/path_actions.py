@@ -589,6 +589,8 @@ class BulkHardLinkPathAction(MultiPathAction):
 
 
 def _path_parts(path):
+    # Package manifests use POSIX-style paths but Windows packages can still
+    # carry backslashes. Normalize both separators before clone planning.
     return tuple(part for part in path.replace("\\", "/").split("/") if part)
 
 
@@ -606,6 +608,17 @@ class BulkClonePathAction(MultiPathAction):
         self._link_path_actions = tuple(link_path_actions)
         self._blocked_short_paths = {
             _path_parts(path) for path in blocked_short_paths if path
+        }
+        # Clone planning compares the same manifest paths many times while it
+        # searches for directory prefixes. Cache the split paths per action so
+        # large packages do not repeatedly allocate identical tuples.
+        self._target_path_parts_by_action = {
+            action: _path_parts(action.target_short_path)
+            for action in self._link_path_actions
+        }
+        self._source_path_parts_by_action = {
+            action: _path_parts(action.source_short_path)
+            for action in self._link_path_actions
         }
         self.transaction_context = link_path_actions[0].transaction_context
         self.package_info = link_path_actions[0].package_info
@@ -643,7 +656,7 @@ class BulkClonePathAction(MultiPathAction):
                 for action in self._link_path_actions
                 if action not in covered_actions
                 and _parts_start_with(
-                    _path_parts(action.target_short_path), directory_parts
+                    self._target_path_parts_by_action[action], directory_parts
                 )
             )
             if not clone_actions:
@@ -718,9 +731,7 @@ class BulkClonePathAction(MultiPathAction):
             action.cleanup()
 
     def _find_clone_directory_parts(self):
-        cloneable_paths = {
-            _path_parts(action.target_short_path) for action in self._link_path_actions
-        }
+        cloneable_paths = set(self._target_path_parts_by_action.values())
         candidate_parts = set()
         for path_parts in cloneable_paths:
             for index in range(1, len(path_parts)):
@@ -760,7 +771,7 @@ class BulkClonePathAction(MultiPathAction):
 
         expected = {
             _parts_to_path(
-                _path_parts(action.source_short_path)[len(directory_parts) :]
+                self._source_path_parts_by_action[action][len(directory_parts) :]
             )
             for action in clone_actions
         }

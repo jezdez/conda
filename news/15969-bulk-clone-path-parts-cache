@@ -1,0 +1,3 @@
+### Enhancements
+
+* Reuse split package manifest paths while planning bulk clone actions to reduce large install transaction overhead. (#15969)
