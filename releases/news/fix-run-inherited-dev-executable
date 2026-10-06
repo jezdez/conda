@@ -1,0 +1,3 @@
+### Bug fixes
+
+* Fix `conda run` activation on POSIX when an inherited development-mode shell uses Python to invoke conda.

@@ -8,6 +8,7 @@ from logging import getLogger
 from os import environ, pathsep
 from os.path import dirname, join
 from pathlib import Path
+from shlex import split
 from shutil import which
 from typing import TYPE_CHECKING
 
@@ -216,3 +217,72 @@ def test_wrap_subprocess_call_dev_mode_deprecation(
             ["echo", "ok"],
         )
     Path(script).unlink(missing_ok=True)
+
+
+@mark_posix_only
+@pytest.mark.parametrize("dev_mode", [False, True])
+@pytest.mark.parametrize(
+    "executable,ce_m,ce_conda,expected",
+    [
+        ("/inherited path/python", "-m", "conda", ["-m", "conda"]),
+        (
+            "/inherited path/python",
+            "arg with spaces",
+            "a'b;$x",
+            ["arg with spaces", "a'b;$x"],
+        ),
+        ("/inherited path/conda", None, None, []),
+        ("/inherited path/conda", "", "", []),
+        ("/inherited path/conda", "-m", None, []),
+        ("/inherited path/conda", None, "conda", []),
+        ("/inherited path/conda", "-m", "", []),
+        ("/inherited path/conda", "", "conda", []),
+        (None, "-m", "conda", []),
+        (None, None, None, []),
+    ],
+)
+def test_wrap_subprocess_call_inherited_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    dev_mode: bool,
+    executable: str | None,
+    ce_m: str | None,
+    ce_conda: str | None,
+    expected: list[str],
+):
+    for name, value in (
+        ("CONDA_EXE", executable),
+        ("_CE_M", ce_m),
+        ("_CE_CONDA", ce_conda),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    with pytest.deprecated_call() if dev_mode else nullcontext():
+        script, _ = utils.wrap_subprocess_call(
+            str(tmp_path), str(tmp_path), dev_mode, False, ["true"]
+        )
+    try:
+        content = Path(script).read_text()
+        hook = next(line for line in content.splitlines() if line.startswith("eval "))
+        argv = split(hook.removeprefix('eval "$(').removesuffix(')"'))
+        if dev_mode:
+            assert argv == [
+                str(tmp_path / "bin" / "python"),
+                "-m",
+                "conda",
+                "shell.posix",
+                "hook",
+                "--dev",
+            ]
+        else:
+            assert argv == [
+                executable or str(tmp_path / "bin" / "conda"),
+                *expected,
+                "shell.posix",
+                "hook",
+            ]
+            assert "PYTHONPATH" not in content
+    finally:
+        Path(script).unlink()

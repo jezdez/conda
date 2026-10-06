@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 import uuid
 from logging import WARNING, getLogger
 from pathlib import Path
@@ -143,6 +144,56 @@ def test_multiline_run_command(
         )
         assert stdout.strip().endswith("Hello!")
         assert not stderr
+
+
+@pytest.mark.skipif(on_win, reason="POSIX-specific executable metadata")
+@pytest.mark.parametrize("live_output", [False, True])
+def test_run_inherited_dev_executable(
+    test_recipes_channel: Path,
+    tmp_env: TmpEnvFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_output: bool,
+):
+    with tmp_env(
+        "small-executable", prefix=tmp_path / "spaced path" / "target"
+    ) as prefix:
+        caller_bin = tmp_path / "caller bin"
+        caller_bin.mkdir()
+        caller_small = caller_bin / "small"
+        caller_small.write_text("#!/bin/sh\necho caller\n")
+        caller_small.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{caller_bin}{os.pathsep}{os.environ['PATH']}")
+        monkeypatch.setenv("CONDA_SHLVL", "0")
+        monkeypatch.delenv("CONDA_PREFIX", raising=False)
+        monkeypatch.setenv("CONDA_EXE", sys.executable)
+        monkeypatch.setenv("_CE_M", "-m")
+        monkeypatch.setenv("_CE_CONDA", "conda")
+        monkeypatch.setenv("CONDA_DEV", "true")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "conda",
+                "run",
+                "--prefix",
+                str(prefix),
+                *(["--live-stream"] if live_output else []),
+                "sh",
+                "-c",
+                'printf "%s\\n" "$CONDA_PREFIX"; command -v small; small',
+            ],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+        assert not result.stderr
+        assert result.stdout.splitlines() == [
+            str(prefix),
+            str(prefix / "bin" / "small"),
+            "Hello!",
+        ]
 
 
 @pytest.mark.parametrize(

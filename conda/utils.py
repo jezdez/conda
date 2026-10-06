@@ -291,6 +291,12 @@ def wrap_subprocess_call(
             conda_exe = [
                 environ.get("CONDA_EXE", abspath(join(root_prefix, "bin", "conda")))
             ]
+            if (
+                environ.get("CONDA_EXE")
+                and environ.get("_CE_M")
+                and environ.get("_CE_CONDA")
+            ):
+                conda_exe.extend((environ["_CE_M"], environ["_CE_CONDA"]))
             dev_arg = ""
             dev_args = []
         with Utf8NamedTemporaryFile(mode="w", delete=False) as fh:
