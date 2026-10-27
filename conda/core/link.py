@@ -92,6 +92,8 @@ log = getLogger(__name__)
 
 
 def determine_link_type(extracted_package_dir, target_prefix):
+    if context._argparse_args.get("copy"):
+        return LinkType.copy
     source_test_file = join(extracted_package_dir, "info", "index.json")
 
     always_copy = context.always_copy
