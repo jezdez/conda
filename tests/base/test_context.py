@@ -1303,3 +1303,48 @@ def test_pkg_dir_unconfigured(context_testdata: None):
     # the default pkgs_dirs come from root_prefix and ~/.conda, not from config
     assert context.pkgs_dirs
     assert all(context.pkg_dir(pkgs_dir) is not None for pkgs_dir in context.pkgs_dirs)
+
+
+def test_pkgs_dirs_bottom_across_sources(context_testdata: None):
+    _set_pkgs_dirs_testdata(
+        lower="pkgs_dirs:\n  - /shared #!bottom\n  - /system\n",
+        higher="pkgs_dirs:\n  - /shared\n  - /user\n",
+    )
+
+    assert context.pkgs_dirs == tuple(map(expand, ("/user", "/system", "/shared")))
+
+
+@pytest.mark.parametrize(
+    "marker,expected,read_only,always_copy",
+    [
+        ("", ("/user", "/shared", "/system"), False, True),
+        ("#!top", ("/shared", "/user", "/system"), True, None),
+        ("#!bottom", ("/user", "/system", "/shared"), True, None),
+    ],
+)
+def test_pkgs_dirs_priority_selects_matching_policy(
+    context_testdata: None, marker, expected, read_only, always_copy
+):
+    _set_pkgs_dirs_testdata(
+        lower=dals(
+            f"""
+            pkgs_dirs:
+              - {marker}
+                path: /shared
+                read_only: true
+              - /system
+            """
+        ),
+        higher=dals(
+            """
+            pkgs_dirs:
+              - /user
+              - path: /shared
+                always_copy: true
+            """
+        ),
+    )
+
+    assert context.pkgs_dirs == tuple(map(expand, expected))
+    assert context.pkg_dir("/shared").read_only is read_only
+    assert context.pkg_dir("/shared").always_copy is always_copy
