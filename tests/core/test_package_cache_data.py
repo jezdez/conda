@@ -1267,3 +1267,21 @@ def test_cached_writability_follows_config_reload(mocker, tmp_path, read_only):
 
     assert cache.is_writable is not read_only
     assert (str(shared_cache) in find_pkgs_dirs()) is not read_only
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.usefixtures("reset_conda_context")
+def test_corrupt_archive_cleanup_respects_read_only(mocker, tmp_path, read_only):
+    shared_cache = tmp_path / "shared-pkgs"
+    create_package_cache_directory(shared_cache)
+    archive = shared_cache / "broken-1.0-0.tar.bz2"
+    archive.write_bytes(b"not an archive")
+    load_condarc(
+        mocker,
+        f"pkgs_dirs:\n  - path: {shared_cache}\n    read_only: {read_only}\n",
+    )
+
+    assert not tuple(PackageCacheData(str(shared_cache)).iter_records())
+    assert archive.exists() is read_only
+    if read_only:
+        assert archive.read_bytes() == b"not an archive"
