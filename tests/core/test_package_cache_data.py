@@ -1220,3 +1220,50 @@ def test_no_wriatable_pkgs_dirs(
     cache = PackageCacheData(str(read_only_cache))
     with pytest.raises(NoWritablePkgsDirError):
         cache.first_writable()
+
+
+@pytest.mark.parametrize("cache_exists", [False, True])
+@pytest.mark.usefixtures("reset_conda_context")
+def test_read_only_cache_without_marker_is_not_created(mocker, tmp_path, cache_exists):
+    shared_cache = tmp_path / "shared-pkgs"
+    user_cache = tmp_path / "user-pkgs"
+    if cache_exists:
+        shared_cache.mkdir()
+    load_condarc(
+        mocker,
+        f"pkgs_dirs:\n  - path: {shared_cache}\n    read_only: true\n  - {user_cache}\n",
+    )
+
+    assert PackageCacheData.first_writable().pkgs_dir == str(user_cache)
+    assert not (shared_cache / PACKAGE_CACHE_MAGIC_FILE).exists()
+    assert shared_cache.exists() is cache_exists
+
+
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.usefixtures("reset_conda_context")
+def test_cached_writability_follows_config_reload(mocker, tmp_path, read_only):
+    from conda.cli.main_clean import find_pkgs_dirs
+
+    shared_cache = tmp_path / "shared-pkgs"
+    create_package_cache_directory(shared_cache)
+    load_condarc(
+        mocker,
+        f"pkgs_dirs:\n  - path: {shared_cache}\n    read_only: {not read_only}\n",
+    )
+    cache = PackageCacheData(str(shared_cache))
+    assert cache.is_writable is read_only
+
+    reset_context(())
+    context._set_raw_data(
+        {
+            "testdata": YamlRawParameter.make_raw_parameters(
+                "testdata",
+                yaml.loads(
+                    f"pkgs_dirs:\n  - path: {shared_cache}\n    read_only: {read_only}\n"
+                ),
+            )
+        }
+    )
+
+    assert cache.is_writable is not read_only
+    assert (str(shared_cache) in find_pkgs_dirs()) is not read_only
